@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Bash(python scripts/preprocess_movielens.py:*)",
+      "Bash(chmod:*)",
+      "Bash(./test_setup.sh:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

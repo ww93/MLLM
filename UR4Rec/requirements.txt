@@ -1,0 +1,31 @@
+# UR4Rec V2 依赖包
+
+# 核心框架
+torch>=2.0.0
+torchvision>=0.15.0
+
+# NLP 和文本处理
+transformers>=4.30.0
+sentence-transformers>=2.2.0
+tokenizers>=0.13.0
+
+# 数据处理
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# 配置和工具
+pyyaml>=6.0
+tqdm>=4.65.0
+requests>=2.31.0
+
+# 图像处理
+Pillow>=10.0.0
+
+# Excel 文件支持（用于读取 text.xls）
+openpyxl>=3.1.0
+xlrd==1.2.0
+
+# 可选：用于更好的性能
+# accelerate>=0.20.0
+# bitsandbytes>=0.41.0

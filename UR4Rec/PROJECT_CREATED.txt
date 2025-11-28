@@ -1,0 +1,225 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║                    UR4Rec Project Successfully Created               ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Paper: "Enhancing Reranking for Recommendation with LLMs through 
+        User Preference Retrieval" (COLING 2025)
+
+Authors: Haobo Zhang, Qiannan Zhu, Zhicheng Dou
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 PROJECT STATISTICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Total Files:          19
+Python Code Lines:    ~2,400
+Documentation:        3 comprehensive guides
+
+📁 PROJECT STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+UR4Rec/
+├── 📖 Documentation
+│   ├── README.md              (Main documentation - comprehensive guide)
+│   ├── QUICKSTART.md          (5-minute quick start guide)
+│   └── PROJECT_SUMMARY.md     (Technical overview and summary)
+│
+├── 🧠 Models (Core Implementation)
+│   ├── user_preference_retriever.py   (Transformer-based retriever)
+│   ├── llm_reranker.py                (LLM integration layer)
+│   └── ur4rec.py                      (Main UR4Rec framework)
+│
+├── 🛠️ Utilities
+│   ├── data_loader.py         (Data processing & loading)
+│   └── metrics.py             (Evaluation metrics: NDCG, HR, MRR, etc.)
+│
+├── 🚀 Scripts
+│   ├── train.py              (Training script with full features)
+│   ├── evaluate.py           (Evaluation with/without LLM)
+│   └── demo.py               (Quick demo script)
+│
+├── ⚙️ Configuration
+│   ├── configs/default_config.yaml    (Default hyperparameters)
+│   ├── requirements.txt               (Dependencies)
+│   └── setup.py                       (Package installation)
+│
+└── 📓 Notebooks
+    └── quickstart.ipynb       (Interactive Jupyter tutorial)
+
+✨ KEY FEATURES IMPLEMENTED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ User Preference Retriever
+   • Multi-layer Transformer encoder (4 layers, 8 heads)
+   • Positional encoding for sequential modeling
+   • Cross-attention mechanism for candidate-history interaction
+   • Configurable architecture (embedding dim, layers, heads)
+
+✅ LLM Integration
+   • OpenAI API support (GPT-3.5, GPT-4)
+   • Anthropic API support (Claude 3)
+   • Local LLM support (HuggingFace models)
+   • Customizable prompt templates
+   • Batch inference support
+
+✅ Training Pipeline
+   • Efficient data loading with automatic padding
+   • Binary cross-entropy loss with masking
+   • Adam optimizer + learning rate scheduling
+   • Early stopping & model checkpointing
+   • TensorBoard integration for monitoring
+
+✅ Evaluation System
+   • NDCG@K (Normalized Discounted Cumulative Gain)
+   • HR@K (Hit Rate)
+   • MRR@K (Mean Reciprocal Rank)
+   • Precision@K, Recall@K, MAP@K
+   • Comparison: Retriever-only vs LLM-enhanced
+
+✅ Additional Features
+   • Sample data generation for testing
+   • Flexible data formats (JSON, CSV, PKL)
+   • Comprehensive documentation
+   • Interactive Jupyter notebook
+   • Production-ready code structure
+
+🚀 QUICK START
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Install dependencies:
+   pip install -r requirements.txt
+
+2. Run the demo:
+   python demo.py
+   
+   Or: ./run_demo.sh
+
+3. Train on your data:
+   python scripts/train.py --config configs/default_config.yaml
+
+4. Evaluate with LLM:
+   export OPENAI_API_KEY="your-key"
+   python scripts/evaluate.py --checkpoint outputs/best_model.pt --use_llm
+
+5. Explore interactively:
+   jupyter notebook notebooks/quickstart.ipynb
+
+📚 USAGE EXAMPLES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Python API:
+───────────
+from models import UR4Rec
+import torch
+
+# Create model
+model = UR4Rec(
+    num_items=10000,
+    embedding_dim=256,
+    num_layers=4,
+    use_llm=True,
+    llm_backend="openai"
+)
+
+# Make predictions
+user_history = torch.tensor([[101, 205, 303, 412]])
+candidates = torch.tensor([[801, 802, 803, 804, 805]])
+
+with torch.no_grad():
+    rankings = model.predict(user_history, candidates)
+
+print(f"Ranked items: {rankings[0]}")
+
+Command Line:
+─────────────
+# Training
+python scripts/train.py \
+    --train_data data/train.json \
+    --num_items 10000 \
+    --batch_size 32 \
+    --num_epochs 50
+
+# Evaluation
+python scripts/evaluate.py \
+    --checkpoint outputs/best_model.pt \
+    --use_llm \
+    --llm_backend openai
+
+🔧 CONFIGURATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Default Hyperparameters:
+• embedding_dim: 256
+• num_layers: 4
+• num_heads: 8
+• d_ff: 1024
+• dropout: 0.1
+• batch_size: 32
+• learning_rate: 0.001
+
+Customize via:
+• Command-line arguments
+• configs/default_config.yaml
+• Python API parameters
+
+📊 EXPECTED PERFORMANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Retriever-only:
+• Fast inference (~1ms per sample on GPU)
+• Good baseline performance
+
+With LLM Reranking:
+• Improved ranking quality (paper reports significant gains)
+• Slower inference (~100ms per sample with API calls)
+• Cost considerations for commercial LLM APIs
+
+📖 DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. README.md          - Comprehensive documentation (50+ sections)
+2. QUICKSTART.md      - Get started in 5 minutes
+3. PROJECT_SUMMARY.md - Technical details and architecture
+4. Inline code docs   - Detailed docstrings in all modules
+5. Jupyter notebook   - Interactive tutorial with visualizations
+
+🎯 NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Run the demo to verify installation:
+   python demo.py
+
+2. Read the QUICKSTART.md for basic usage
+
+3. Explore the Jupyter notebook:
+   jupyter notebook notebooks/quickstart.ipynb
+
+4. Prepare your own dataset in the required format
+
+5. Train on your data:
+   python scripts/train.py --train_data your_data.json
+
+6. Set up LLM API keys for enhanced reranking:
+   export OPENAI_API_KEY="your-key"
+
+7. Evaluate and compare results
+
+📄 CITATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@inproceedings{zhang2025enhancing,
+  title={Enhancing Reranking for Recommendation with LLMs through 
+         User Preference Retrieval},
+  author={Zhang, Haobo and Zhu, Qiannan and Dou, Zhicheng},
+  booktitle={Proceedings of the 31st International Conference on 
+             Computational Linguistics},
+  pages={658--671},
+  year={2025}
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✨ Project is ready to use! Start with: python demo.py
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
