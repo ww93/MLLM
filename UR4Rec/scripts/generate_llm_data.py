@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List
 
-from models.llm_generator import LLMPreferenceGenerator, MockLLMGenerator
+from models.llm_generator import LLMPreferenceGenerator
 
 
 def load_dataset(data_dir: str, split: str = 'train') -> Dict:
@@ -255,8 +255,8 @@ def main():
     parser.add_argument('--output_dir', type=str, required=True,
                         help='输出目录')
 
-    parser.add_argument('--llm_backend', type=str, default='mock',
-                        choices=['openai', 'anthropic', 'local', 'mock'],
+    parser.add_argument('--llm_backend', type=str, default='openai',
+                        choices=['openai', 'anthropic', 'local'],
                         help='LLM 后端')
     parser.add_argument('--model_name', type=str, default='gpt-3.5-turbo',
                         help='LLM 模型名称')
@@ -314,19 +314,23 @@ def main():
     print(f"  物品元数据数: {len(item_metadata)}")
 
     # 创建 LLM 生成器
-    if args.llm_backend == 'mock':
-        print("\n使用模拟生成器（无需 API）")
-        generator = MockLLMGenerator(
-            cache_dir=args.cache_dir
-        )
-    else:
-        print(f"\n使用 {args.llm_backend} 后端")
-        generator = LLMPreferenceGenerator(
-            llm_backend=args.llm_backend,
-            model_name=args.model_name,
-            api_key=args.api_key,
-            cache_dir=args.cache_dir
-        )
+    print(f"\n使用 {args.llm_backend} 后端")
+
+    # 确保设置了API密钥
+    if args.api_key is None:
+        print("\n错误: 请提供API密钥")
+        print("  使用 --api_key 参数或设置环境变量:")
+        print("  - OpenAI: export OPENAI_API_KEY=your-key")
+        print("  - DashScope: export DASHSCOPE_API_KEY=your-key")
+        print("  - Anthropic: export ANTHROPIC_API_KEY=your-key")
+        return
+
+    generator = LLMPreferenceGenerator(
+        llm_backend=args.llm_backend,
+        model_name=args.model_name,
+        api_key=args.api_key,
+        cache_dir=args.cache_dir
+    )
 
     # 生成用户偏好
     if not args.skip_users:

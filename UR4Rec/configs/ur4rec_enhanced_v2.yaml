@@ -1,0 +1,101 @@
+# UR4Rec Enhanced V2 - 整合所有Phase 2改进
+# 预期提升: HR@10 从 0.4 到 0.63-0.77
+
+# Dataset settings
+num_items: 1682  # Will be overridden by actual data
+max_seq_len: 50
+
+# ========================================
+# Phase 2 改进 1: 增强SASRec架构
+# ========================================
+sasrec_hidden_dim: 768  # 从512增加到768 (+50%容量)
+sasrec_num_blocks: 6    # 从3增加到6 (2x深度)
+sasrec_num_heads: 12    # 从8增加到12 (+50%注意力头)
+sasrec_dropout: 0.2     # 稍微降低dropout以适应更大模型
+
+# Text encoder parameters
+text_model_name: "all-MiniLM-L6-v2"
+text_embedding_dim: 384
+retriever_output_dim: 768  # 匹配SASRec的hidden_dim以便更好融合
+
+# ========================================
+# Phase 2 改进 2: Hierarchical MoE
+# ========================================
+use_hierarchical_moe: true  # 启用层级MoE
+moe_num_heads: 8
+moe_dropout: 0.1
+moe_num_proxies: 8
+num_sub_experts: 3  # 每个模态3个sub-experts (共9个experts)
+
+# Sub-expert specialization (用于分析)
+sub_expert_roles:
+  user_pref: ["genre", "mood", "style"]
+  item_desc: ["content", "theme", "quality"]
+  image_feat: ["composition", "color", "objects"]
+
+# CLIP parameters
+use_clip: true
+clip_features_path: "UR4Rec/data/clip_features.pt"
+use_adaptive_clip_projection: true  # 启用可训练的CLIP投影
+
+# ========================================
+# Phase 2 改进 3: 增强负采样
+# ========================================
+num_negatives: 500  # 从20增加到500 (25x)
+use_in_batch_negatives: true  # 使用batch内其他样本作为额外负样本
+hard_negative_ratio: 0.3  # 30%使用hard negatives (相似但不匹配的物品)
+
+# ========================================
+# Phase 2 改进 4: 对比学习
+# ========================================
+use_contrastive_loss: true  # 启用对比学习
+contrastive_temperature: 0.07
+contrastive_loss_weight: 0.3  # 对比学习loss的权重
+
+use_clip_text_alignment: true  # CLIP和文本对齐
+alignment_loss_weight: 0.2
+
+# Memory mechanism parameters
+max_memory_size: 20
+update_trigger: "INTERACTION_COUNT"
+interaction_threshold: 5
+drift_threshold: 0.3
+decay_factor: 0.95
+
+# ========================================
+# Fusion parameters - 改进融合机制
+# ========================================
+fusion_method: "gating"  # 使用学习的gating而非固定权重
+# 如果使用weighted，这些是fallback权重
+sasrec_weight: 0.4
+retriever_weight: 0.6
+
+# Training parameters
+sasrec_lr: 0.0003      # 更大模型用更小学习率
+retriever_lr: 0.0008   # 适度降低
+use_uncertainty_weighting: false
+use_adaptive_alternating: false
+
+# Training stages
+stages:
+  - pretrain_sasrec      # 阶段1: 预训练增强的SASRec
+  - pretrain_retriever   # 阶段2: 预训练Hierarchical MoE Retriever
+  - joint_finetune       # 阶段3: 联合微调 (with contrastive loss)
+  - end_to_end          # 阶段4: 端到端训练
+
+epochs_per_stage: 50
+patience: 25
+
+# Other settings
+batch_size: 32  # 增加batch size以支持更多负样本
+num_workers: 4
+seed: 42
+
+# ========================================
+# 预期效果
+# ========================================
+# 1. 增强SASRec: +3-5%
+# 2. Hierarchical MoE: +8-12%
+# 3. 更多负样本: +5-10%
+# 4. 对比学习: +4-8%
+# 总计: +20-35% → HR@10: 0.40 → 0.48-0.54 (保守) 或 0.56-0.62 (乐观)

@@ -6,13 +6,12 @@ UR4Rec V2: 正确的架构实现
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import json
 from pathlib import Path
 
 from .sasrec import SASRec
 from .text_preference_retriever import TextPreferenceRetriever, TextEncoder
-from .llm_generator import MockLLMGenerator
 
 
 class UR4RecV2(nn.Module):

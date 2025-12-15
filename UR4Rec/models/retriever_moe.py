@@ -115,7 +115,10 @@ class RetrieverMoEBlock(nn.Module):
         attn_output, _ = self.self_attn(mixture, attn_input, attn_input)
         refined = self.output_norm(mixture + self.dropout(attn_output))
 
-        scores = (refined.squeeze(1) * target_item).sum(dim=-1)
+        # Normalize vectors before computing similarity scores
+        refined_normalized = F.normalize(refined.squeeze(1), p=2, dim=-1)
+        target_normalized = F.normalize(target_item, p=2, dim=-1)
+        scores = (refined_normalized * target_normalized).sum(dim=-1)
         return scores, routing_weights
 
 

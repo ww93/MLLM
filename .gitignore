@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+ENV/
+env/
+
+# PyTorch
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Training outputs
+outputs/
+checkpoints/
+logs/
+runs/
+wandb/
+
+# Training logs
+*.log
+train_*.log
+*.out
+
+# Data
+data/
+UR4Rec/data/
+*.csv
+*.json.gz
+*.pkl
+*.pickle
+
+# Models
+models/*.pt
+models/*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Cache
+.cache/
+*.cache
+__pycache__/
+
+# Environment
+.env
+.env.local
+
+# LLM Cache
+data/llm_generated/llm_cache/
+*.cache.json
+
+# Keep config files and scripts
+!UR4Rec/configs/*.yaml
+!UR4Rec/scripts/*.py
+!requirements.txt
+!*.md

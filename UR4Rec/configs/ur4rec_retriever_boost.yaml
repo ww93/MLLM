@@ -1,0 +1,56 @@
+# UR4Rec Configuration - Retriever Boost Training
+# 目标：让retriever带来从0.3到0.8的性能提升
+
+# Dataset settings
+num_items: 1682
+max_seq_len: 50
+
+# SASRec parameters
+sasrec_hidden_dim: 128
+sasrec_num_blocks: 3
+sasrec_num_heads: 8
+sasrec_dropout: 0.25
+
+# Text encoder parameters
+text_model_name: "all-MiniLM-L6-v2"
+text_embedding_dim: 384
+retriever_output_dim: 128
+
+# MoE parameters
+moe_num_heads: 8
+moe_dropout: 0.2
+moe_num_proxies: 4
+
+# Memory mechanism parameters
+max_memory_size: 20
+update_trigger: "INTERACTION_COUNT"
+interaction_threshold: 5
+drift_threshold: 0.3
+decay_factor: 0.95
+
+# Fusion parameters - 从0.3提升到0.8需要强力的retriever
+fusion_method: "weighted"
+sasrec_weight: 0.4    # SASRec提供baseline (0.3-0.4)
+retriever_weight: 0.6  # Retriever提供主要提升 (目标0.4-0.5额外提升)
+
+# Training parameters
+sasrec_lr: 0.001       # SASRec学习率
+retriever_lr: 0.003    # Retriever更高学习率以快速学习
+use_uncertainty_weighting: false
+use_adaptive_alternating: false
+
+# Training stages - 多阶段训练策略
+stages:
+  - pretrain_sasrec      # 第1阶段：预训练SASRec建立baseline
+  - pretrain_retriever   # 第2阶段：预训练retriever学习文本匹配
+  - joint_finetune       # 第3阶段：联合微调
+  - end_to_end          # 第4阶段：端到端训练
+
+epochs_per_stage: 25   # 每阶段25 epochs，总共100 epochs
+patience: 15
+
+# Other settings
+batch_size: 16
+num_workers: 4
+seed: 42
+num_negatives: 20

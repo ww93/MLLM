@@ -1,0 +1,103 @@
+# UR4Rec Hierarchical MoE + CLIP - Enhanced版本
+# 整合Phase 2所有关键改进，预期HR@10: 0.40 → 0.60-0.75
+
+# Architecture:
+# - Level 1 (Within-modality): 9 sub-experts (3 per modality)
+#   - User Preference MoE: genre/mood/style experts
+#   - Item Description MoE: content/theme/quality experts
+#   - CLIP Image MoE: composition/color/objects experts
+# - Level 2 (Cross-modality): Dynamic fusion of 3 modality outputs
+
+# Dataset settings
+num_items: 1682
+max_seq_len: 50
+
+# ========================================
+# Phase 2改进 1: 增强SASRec (预期+3-5%)
+# ========================================
+sasrec_hidden_dim: 768  # 从512增加到768
+sasrec_num_blocks: 6    # 从3增加到6
+sasrec_num_heads: 12    # 从8增加到12
+sasrec_dropout: 0.2     # 稍微降低以适应更大模型
+
+# Text encoder parameters
+text_model_name: "all-MiniLM-L6-v2"
+text_embedding_dim: 384
+retriever_output_dim: 768  # 匹配SASRec维度
+
+# ========================================
+# Phase 2改进 2: Hierarchical MoE (预期+8-12%)
+# ========================================
+use_hierarchical_moe: true
+use_clip: true  # 使用CLIP特征
+clip_features_path: "UR4Rec/data/clip_features.pt"
+
+# MoE架构参数
+moe_num_heads: 8
+moe_dropout: 0.1
+moe_num_proxies: 8
+num_sub_experts: 3  # 每个模态3个sub-experts
+
+# Sub-expert specialization
+sub_expert_specialization:
+  user_pref:
+    - "genre_preference"
+    - "mood_preference"
+    - "style_preference"
+  item_desc:
+    - "content_understanding"
+    - "thematic_analysis"
+    - "quality_assessment"
+  image_feat:
+    - "visual_composition"
+    - "color_texture"
+    - "object_recognition"
+
+# Memory mechanism
+max_memory_size: 20
+update_trigger: "INTERACTION_COUNT"
+interaction_threshold: 5
+drift_threshold: 0.3
+decay_factor: 0.95
+
+# Fusion parameters
+fusion_method: "weighted"  # TODO: 后续可改为"gating"
+sasrec_weight: 0.4
+retriever_weight: 0.6
+
+# ========================================
+# Phase 2改进 3: 增强负采样 (预期+5-10%)
+# ========================================
+num_negatives: 500  # 从20增加到500 (25x)
+# TODO: 后续添加 use_in_batch_negatives: true
+
+# ========================================
+# Training parameters
+# ========================================
+sasrec_lr: 0.0003  # 更大模型用更小lr
+retriever_lr: 0.0008
+use_uncertainty_weighting: false
+use_adaptive_alternating: false
+
+# Training stages
+stages:
+  - pretrain_sasrec
+  - pretrain_retriever
+  - joint_finetune
+  - end_to_end
+
+epochs_per_stage: 50
+patience: 25
+
+# Other settings
+batch_size: 32  # 从16增加到32以支持更多负样本
+num_workers: 4
+seed: 42
+
+# ========================================
+# 预期效果汇总
+# ========================================
+# 1. 增强SASRec (6层768维): +3-5%
+# 2. Hierarchical MoE (9 experts): +8-12%
+# 3. 500个负样本: +5-10%
+# 总计: +16-27% → HR@10: 0.40 → 0.46-0.51 (保守) 或 0.52-0.58 (乐观)

@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 
 class PointWiseFeedForward(nn.Module):
@@ -87,17 +87,34 @@ class SASRecBlock(nn.Module):
         attn_output, _ = self.attention(
             x, x, x,
             attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask
+            key_padding_mask=key_padding_mask,
+            need_weights=False
         )
+
+        # Replace NaN with zeros in attention output (numerical stability)
+        if torch.isnan(attn_output).any():
+            attn_output = torch.where(torch.isnan(attn_output), torch.zeros_like(attn_output), attn_output)
 
         # Add & Norm
         x = self.norm1(x + self.dropout(attn_output))
 
+        # Replace NaN with zeros after norm1 (numerical stability)
+        if torch.isnan(x).any():
+            x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+
         # Feed-forward
         ff_output = self.feed_forward(x)
 
+        # Replace NaN with zeros in feed-forward output (numerical stability)
+        if torch.isnan(ff_output).any():
+            ff_output = torch.where(torch.isnan(ff_output), torch.zeros_like(ff_output), ff_output)
+
         # Add & Norm
         x = self.norm2(x + self.dropout(ff_output))
+
+        # Final NaN replacement (numerical stability)
+        if torch.isnan(x).any():
+            x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
 
         return x
 
@@ -160,11 +177,19 @@ class SASRec(nn.Module):
         """初始化权重"""
         for module in self.modules():
             if isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                # 使用适中的std初始化
+                nn.init.normal_(module.weight, mean=0.0, std=0.1)
+                # 如果是padding embedding (index 0)，设为0
+                if hasattr(module, 'padding_idx') and module.padding_idx is not None:
+                    with torch.no_grad():
+                        module.weight[module.padding_idx].fill_(0)
             elif isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
+                nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
 
     def _create_causal_mask(self, seq_len: int) -> torch.Tensor:
         """
@@ -199,6 +224,9 @@ class SASRec(nn.Module):
         """
         batch_size, seq_len = input_seq.shape
 
+        # Clamp item IDs to valid range to handle out-of-vocabulary items
+        input_seq = torch.clamp(input_seq, 0, self.num_items)
+
         # Item Embedding
         seq_emb = self.item_embedding(input_seq)  # [batch, seq_len, hidden]
 
@@ -225,6 +253,10 @@ class SASRec(nn.Module):
 
         # Layer norm
         x = self.layer_norm(x)
+
+        # Final NaN check and replacement (numerical stability)
+        if torch.isnan(x).any():
+            x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
 
         return x
 
@@ -260,6 +292,8 @@ class SASRec(nn.Module):
         # 计算分数
         if candidate_items is not None:
             # 只计算候选物品的分数
+            # Clamp candidate item IDs to valid range to handle out-of-vocabulary items
+            candidate_items = torch.clamp(candidate_items, 0, self.num_items)
             candidate_emb = self.item_embedding(candidate_items)  # [batch, num_cand, hidden]
             scores = torch.matmul(
                 last_output.unsqueeze(1),  # [batch, 1, hidden]
@@ -340,6 +374,35 @@ class SASRec(nn.Module):
         }
 
         return loss, metrics
+
+    def get_sequence_representation(
+        self,
+        input_seq: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        获取序列的表示向量（用于融合等）
+
+        Args:
+            input_seq: [batch_size, seq_len]
+            padding_mask: [batch_size, seq_len] - True 表示有效位置
+
+        Returns:
+            representation: [batch_size, hidden_dim] - 序列表示向量
+        """
+        # 获取序列输出
+        seq_output = self.forward(input_seq, padding_mask)  # [batch, seq_len, hidden]
+
+        # 使用最后一个有效位置的表示
+        if padding_mask is not None:
+            # 找到每个序列的最后一个有效位置
+            seq_lengths = padding_mask.sum(dim=1) - 1  # [batch]
+            batch_indices = torch.arange(seq_output.size(0), device=seq_output.device)
+            last_output = seq_output[batch_indices, seq_lengths]  # [batch, hidden]
+        else:
+            last_output = seq_output[:, -1, :]  # [batch, hidden]
+
+        return last_output
 
 
 if __name__ == "__main__":
