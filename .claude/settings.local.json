@@ -6,7 +6,20 @@
       "Bash(find:*)",
       "Bash(python scripts/preprocess_movielens.py:*)",
       "Bash(chmod:*)",
-      "Bash(./test_setup.sh:*)"
+      "Bash(./test_setup.sh:*)",
+      "Bash(python3:*)",
+      "Bash(source venv/bin/activate)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "Bash(timeout 300 python:*)",
+      "Bash(tee:*)",
+      "Bash(xargs kill:*)",
+      "Bash(grep:*)",
+      "Bash(timeout 180 python:*)",
+      "Bash(wc:*)",
+      "Bash(bash:*)",
+      "Bash(kill:*)"
     ],
     "deny": [],
     "ask": []

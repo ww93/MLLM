@@ -1,0 +1,56 @@
+# Federated Learning Configuration for UR4Rec
+# 基于 ur4rec_moe_100k.yaml 修改
+
+# Dataset settings
+num_items: 1682
+max_seq_len: 50
+
+# ========================================
+# SASRec Configuration (与中心化训练一致)
+# ========================================
+sasrec_hidden_dim: 512
+sasrec_num_blocks: 3
+sasrec_num_heads: 8
+sasrec_dropout: 0.1
+
+# Text encoder parameters
+text_model_name: "all-MiniLM-L6-v2"
+text_embedding_dim: 384
+retriever_output_dim: 512
+
+# ========================================
+# Federated Learning Specific Parameters
+# ========================================
+# 联邦学习参数
+federated_lr: 0.001           # 客户端本地学习率
+weight_decay: 0.00001         # 权重衰减
+
+# 本地训练参数
+local_epochs: 1               # 每轮客户端本地训练轮数
+batch_size: 16                # 客户端批大小
+num_negatives: 100            # 负样本数量
+
+# 聚合参数
+aggregation_method: "fedavg"  # 聚合方法 (fedavg, fedprox)
+client_fraction: 0.1          # 每轮参与训练的客户端比例
+
+# 全局训练参数
+num_rounds: 50                # 联邦学习总轮数
+patience: 10                  # Early stopping patience
+
+# Other settings
+seed: 42
+
+# ========================================
+# 说明
+# ========================================
+# 1. 每个user作为一个client
+# 2. 数据划分：leave-one-out
+#    - 训练集：除最后2个item外的所有历史
+#    - 验证集：倒数第2个item
+#    - 测试集：最后1个item
+# 3. 训练流程：
+#    - Round 1: 选择10%客户端 → 本地训练 → 上传参数 → FedAvg聚合 → 下发全局模型
+#    - Round 2: ...
+#    - 直至收敛或达到最大轮数
+# 4. 性能目标：与中心化训练相当 (HR@10 ≈ 0.41)
