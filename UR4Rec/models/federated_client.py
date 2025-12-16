@@ -27,7 +27,7 @@ class ClientDataset(Dataset):
     单个客户端（用户）的数据集
 
     使用 leave-one-out 划分：
-    - 训练集：除最后2个item外的所有历史
+    - 训练集：除最后2个item外的所有历史，使用滑动窗口生成训练样本
     - 验证集：倒数第2个item
     - 测试集：最后1个item
     """
@@ -47,7 +47,7 @@ class ClientDataset(Dataset):
             split: 数据集划分
         """
         self.user_id = user_id
-        self.sequence = sequence
+        self.full_sequence = sequence
         self.max_seq_len = max_seq_len
         self.split = split
 
@@ -55,6 +55,7 @@ class ClientDataset(Dataset):
         if split == "test":
             self.target_item = sequence[-1]
             self.input_seq = sequence[:-1]
+            self.train_samples = None
         elif split == "val":
             if len(sequence) < 2:
                 # 数据太少，使用最后一个作为验证
@@ -63,26 +64,39 @@ class ClientDataset(Dataset):
             else:
                 self.target_item = sequence[-2]
                 self.input_seq = sequence[:-2]
+            self.train_samples = None
         else:  # train
-            # 训练时使用所有历史（除测试/验证外）
+            # 训练时：排除最后2个（用于val/test），生成滑动窗口样本
             if len(sequence) < 3:
+                # 数据太少，使用简单划分
                 self.target_item = sequence[-1]
                 self.input_seq = sequence[:-1]
+                self.train_samples = None
             else:
-                # 排除最后2个作为验证/测试
-                self.input_seq = sequence[:-2]
-                self.target_item = None
+                # 使用滑动窗口生成训练样本
+                # 例如 [1,2,3,4,5,6,7,8]，排除[7,8]用于val/test
+                # 生成：[1]→2, [1,2]→3, [1,2,3]→4, [1,2,3,4]→5, [1,2,3,4,5]→6
+                train_seq = sequence[:-2]
 
-        # 截断/填充序列
-        if len(self.input_seq) > max_seq_len:
-            self.input_seq = self.input_seq[-max_seq_len:]
-        else:
-            # 填充 0 (padding token)
-            padding = [0] * (max_seq_len - len(self.input_seq))
-            self.input_seq = padding + self.input_seq
+                # 如果train_seq长度<=1，无法生成滑动窗口，使用简单划分
+                if len(train_seq) <= 1:
+                    self.target_item = sequence[-1]
+                    self.input_seq = sequence[:-1]
+                    self.train_samples = None
+                else:
+                    self.train_samples = []
+                    for i in range(1, len(train_seq)):
+                        input_items = train_seq[:i]
+                        target = train_seq[i]
+                        self.train_samples.append((input_items, target))
+
+                    self.target_item = None
+                    self.input_seq = None
 
     def __len__(self) -> int:
-        return 1 if self.split in ['val', 'test'] else max(1, len(self.sequence) - 2)
+        if self.split == 'train' and self.train_samples is not None:
+            return len(self.train_samples)
+        return 1
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
@@ -92,13 +106,29 @@ class ClientDataset(Dataset):
             {
                 'user_id': user ID
                 'item_seq': 输入序列 [max_seq_len]
-                'target_item': 目标item (仅 val/test)
+                'target_item': 目标item
             }
         """
+        if self.split == 'train' and self.train_samples is not None:
+            # 训练集：返回第idx个样本
+            input_items, target_item = self.train_samples[idx]
+        else:
+            # 验证/测试集：返回单个样本
+            input_items = self.input_seq
+            target_item = self.target_item
+
+        # 截断/填充序列
+        if len(input_items) > self.max_seq_len:
+            input_items = input_items[-self.max_seq_len:]
+        else:
+            # 填充 0 (padding token)
+            padding = [0] * (self.max_seq_len - len(input_items))
+            input_items = padding + input_items
+
         return {
             'user_id': torch.tensor(self.user_id, dtype=torch.long),
-            'item_seq': torch.tensor(self.input_seq, dtype=torch.long),
-            'target_item': torch.tensor(self.target_item if self.target_item is not None else 0, dtype=torch.long)
+            'item_seq': torch.tensor(input_items, dtype=torch.long),
+            'target_item': torch.tensor(target_item, dtype=torch.long)
         }
 
 
@@ -384,15 +414,16 @@ class FederatedClient:
             seq_output = self.model(item_seq)
             seq_repr = seq_output[:, -1, :]  # [1, D]
 
-            # 计算所有items的得分
-            all_item_ids = torch.arange(1, self.num_items, device=self.device)  # [num_items-1]
-            all_item_embs = self.model.item_embedding(all_item_ids)  # [num_items-1, D]
+            # 计算所有items的得分（注意：item ID从1开始，0是padding）
+            all_item_ids = torch.arange(1, self.num_items, device=self.device)  # [1, 2, ..., 1681]
+            all_item_embs = self.model.item_embedding(all_item_ids)  # [1681, D]
 
-            scores = torch.matmul(seq_repr, all_item_embs.T).squeeze(0)  # [num_items-1]
+            scores = torch.matmul(seq_repr, all_item_embs.T).squeeze(0)  # [1681]
 
-            # 排序获取Top-K
-            _, top_k_items = torch.topk(scores, max(k_list))
-            top_k_items = top_k_items.cpu().numpy() + 1  # 映射回原始item ID
+            # 排序获取Top-K（scores的索引对应all_item_ids的索引）
+            _, top_k_indices = torch.topk(scores, max(k_list))
+            # 通过索引获取实际的item ID（all_item_ids已经是真实ID）
+            top_k_items = all_item_ids[top_k_indices].cpu().numpy()
 
             # 计算指标
             metrics = {}
