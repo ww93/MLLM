@@ -1,17 +1,17 @@
+#!/usr/bin/env python3
 """
-Extract CLIP image features for MovieLens items.
+Extract CLIP image features for ML-1M items.
 
 This script:
-1. Loads item images from the Multimodal_Datasets directory
+1. Loads item images from M_ML-1M/image directory
 2. Uses CLIP to extract visual features
-3. Saves features for fast loading during training
+3. Saves features to ml1m folder for training
 """
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 import argparse
-import json
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -20,7 +20,7 @@ from UR4Rec.models.clip_image_encoder import CLIPImageEncoder
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract CLIP features for items')
+    parser = argparse.ArgumentParser(description='Extract CLIP features for ML-1M items')
     parser.add_argument(
         '--data_dir',
         type=str,
@@ -30,8 +30,8 @@ def main():
     parser.add_argument(
         '--output_path',
         type=str,
-        default='UR4Rec/data/M_ML-1M/clip_features.pt',
-        help='Path to save extracted features'
+        default='UR4Rec/data/ml1m/clip_features.pt',
+        help='Path to save extracted features (in ml1m folder)'
     )
     parser.add_argument(
         '--clip_model',
@@ -60,9 +60,9 @@ def main():
     )
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("CLIP Feature Extraction")
-    print("=" * 60)
+    print("=" * 70)
+    print("ML-1M CLIP Feature Extraction")
+    print("=" * 70)
     print(f"Data directory: {args.data_dir}")
     print(f"Output path: {args.output_path}")
     print(f"CLIP model: {args.clip_model}")
@@ -82,8 +82,6 @@ def main():
 
     # Build item_id -> image_path mapping
     data_dir = Path(args.data_dir)
-
-    # MovieLens images are in M_ML-100K/image directory
     images_dir = data_dir / 'M_ML-1M' / 'image'
 
     if not images_dir.exists():
@@ -91,13 +89,12 @@ def main():
         return
 
     # Count total items from image files
-    # Images are named: 1.png, 2.png, ..., 1682.png
     all_image_files = list(images_dir.glob('*.png'))
     if not all_image_files:
         print(f"错误: 图片目录中没有找到PNG文件: {images_dir}")
         return
 
-    # Extract item IDs from filenames to determine range
+    # Extract item IDs from filenames
     item_ids_from_files = []
     for img_path in all_image_files:
         try:
@@ -112,7 +109,7 @@ def main():
 
     max_file_id = max(item_ids_from_files)
 
-    # 读取ratings.dat确定实际的物品数量
+    # Read ratings.dat to determine actual item range
     ratings_file = data_dir / 'M_ML-1M' / 'ratings.dat'
     actual_max_item_id = 0
 
@@ -159,7 +156,7 @@ def main():
 
     print(f"✓ 成功映射 {len(item_image_paths)}/{num_items} 个物品到图片文件")
 
-    # Verification: Show sample mappings to ensure correctness
+    # Verification: Show sample mappings
     print("\n验证映射 (前10个物品):")
     for item_id in range(1, min(11, num_items + 1)):
         if item_id in item_image_paths:
@@ -183,16 +180,14 @@ def main():
     clip_encoder.save_features(item_features, str(output_path))
 
     print()
-    print("=" * 60)
+    print("=" * 70)
     print("验证 Item ID 对应关系")
-    print("=" * 60)
+    print("=" * 70)
 
-    # Critical verification: Ensure item_features[i] corresponds to item i
-    # We'll spot-check by re-encoding a few items and comparing
-    test_item_ids = [1, 10, 100, min(500, num_items), min(1000, num_items)]
+    # Verification: spot-check by re-encoding a few items
+    test_item_ids = [1, 10, 100, min(500, num_items), min(1000, num_items), min(3000, num_items)]
     print("抽查验证 (重新编码几个物品并比较特征):")
 
-    # Ensure model is in eval mode for deterministic verification
     clip_encoder.eval()
 
     all_match = True
@@ -201,7 +196,7 @@ def main():
             continue
 
         # Re-encode this single item
-        with torch.no_grad():  # Disable gradients for verification
+        with torch.no_grad():
             single_features = clip_encoder.encode_images_batch([item_image_paths[item_id]])
             single_projected = clip_encoder.forward(single_features)
 
@@ -225,18 +220,26 @@ def main():
         return
 
     print()
-    print("=" * 60)
+    print("=" * 70)
     print("完成!")
-    print("=" * 60)
+    print("=" * 70)
     print(f"特征已保存至: {output_path}")
     print(f"特征形状: {item_features.shape}")
     print(f"特征维度: {args.output_dim}")
     print(f"有效物品数: {len(item_image_paths)}/{num_items}")
     print()
-    print("✓ Item ID 对应关系已验证正确，不会张冠李戴!")
+    print("✓ Item ID 对应关系已验证正确!")
     print()
-    print("使用方法:")
-    print(f"在训练脚本中添加参数: --clip_features_path {output_path}")
+    print("下一步:")
+    print(f"  1. 抽取文本特征:")
+    print(f"     python UR4Rec/scripts/extract_ml1m_text_features.py")
+    print(f"  2. 运行训练:")
+    print(f"     python UR4Rec/scripts/train_fedmem.py \\")
+    print(f"         --data_dir UR4Rec/data \\")
+    print(f"         --data_file ml1m_ratings_processed.dat \\")
+    print(f"         --visual_file ml1m/clip_features.pt \\")
+    print(f"         --text_file ml1m/text_features.pt \\")
+    print(f"         --num_rounds 50 --device cpu")
 
 
 if __name__ == '__main__':

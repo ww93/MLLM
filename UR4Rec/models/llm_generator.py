@@ -23,7 +23,7 @@ class LLMPreferenceGenerator:
         self,
         llm_backend: str = "openai",
         model_name: str = "qwen-flash",
-        api_key: Optional[str] = "sk-de8b84b8aca743cfa6fb42ec2776280b",
+        api_key: Optional[str] = None,
         base_url: Optional[str] = "https://dashscope.aliyuncs.com/compatible-mode/v1",
         cache_dir: str = "data/llm_cache",
         enable_thinking: bool = False
@@ -32,8 +32,8 @@ class LLMPreferenceGenerator:
         Args:
             llm_backend: LLM 后端 ('openai', 'anthropic', 'local')
             model_name: 模型名称
-            api_key: API 密钥
-            base_url: 自定义API地址（用于OpenAI兼容API，如vLLM, LocalAI等）
+            api_key: API 密钥（如果为 None，从环境变量 DASHSCOPE_API_KEY 读取）
+            base_url: 自定义API地址（用于OpenAI兼容API，如 DashScope）
             cache_dir: 缓存目录
             enable_thinking: 是否启用深度思考模式（仅 DashScope qwen-flash 等支持）
         """
@@ -42,6 +42,11 @@ class LLMPreferenceGenerator:
         self.enable_thinking = enable_thinking
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # 如果没有提供 API key，从环境变量读取
+        if api_key is None:
+            import os
+            api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
 
         # 初始化 LLM 客户端
         self._init_llm(api_key, base_url)
@@ -126,15 +131,11 @@ class LLMPreferenceGenerator:
                 "temperature": 0.7
             }
 
-            # 添加思考模式参数
-            if self.enable_thinking or extra_body:
-                merged_extra = {}
-                if self.enable_thinking:
-                    merged_extra["enable_thinking"] = True
-                if extra_body:
-                    merged_extra.update(extra_body)
-                request_params["extra_body"] = merged_extra
+            # 添加额外参数（如果有）
+            if extra_body:
+                request_params["extra_body"] = extra_body
 
+            # 调用 API
             response = self.client.chat.completions.create(**request_params)
             return response.choices[0].message.content
 
@@ -249,15 +250,17 @@ User preference summary:"""
         title = item_metadata.get('title', f'Item {item_id}')
         genres = item_metadata.get('genres', 'Unknown')
 
-        prompt = f"""Generate a concise description for the following item for a recommendation system.
+        prompt = f"""Analyze the movie '{title}'. Do NOT summarize the plot. Instead, construct a dense semantic profile focusing on:
+1. Visual Aesthetics (e.g., color palette, lighting, cinematography style).
+2. Core Themes (e.g., existentialism, betrayal, coming-of-age).
+3. Emotional Tone & Atmosphere (e.g., melancholic, gritty, whimsical).
+4. Target Audience Appeal (Why fans love it).
+Output a concise, high-density paragraph using distinctive adjectives.
 
-Item information:
-- Title: {title}
-- Genres: {genres}
+Movie Title: {title}
+Genres: {genres}
 
-Please describe the item's core features and target audience in 1-2 sentences.
-
-Item description:"""
+Description:"""
 
         # 调用 LLM（带错误处理）
         try:

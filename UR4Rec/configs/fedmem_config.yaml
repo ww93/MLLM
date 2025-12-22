@@ -1,0 +1,130 @@
+# FedMem配置文件
+# 使用方法: python scripts/train_fedmem.py --config configs/fedmem_config.yaml
+
+# ============================================
+# 数据参数
+# ============================================
+data:
+  data_dir: "data/ml-1m"
+  data_file: "ratings.dat"
+  min_sequence_length: 5  # 最小序列长度（用于过滤用户）
+
+# ============================================
+# 模型参数
+# ============================================
+model:
+  # SASRec参数
+  sasrec_hidden_dim: 256
+  sasrec_num_blocks: 2
+  sasrec_num_heads: 4
+  sasrec_dropout: 0.1
+
+  # Text Retriever参数
+  text_model_name: "all-MiniLM-L6-v2"
+  text_embedding_dim: 384
+  retriever_output_dim: 256
+
+  # MoE参数
+  moe_num_heads: 8
+  moe_dropout: 0.1
+  moe_num_proxies: 4
+
+  # Fusion参数
+  fusion_method: "weighted"  # weighted, learned, adaptive
+  sasrec_weight: 0.5
+  retriever_weight: 0.5
+
+  # 序列参数
+  max_seq_len: 50
+
+# ============================================
+# FedMem参数
+# ============================================
+fedmem:
+  # 记忆参数
+  memory_capacity: 50              # 本地记忆容量
+  surprise_threshold: 0.5          # Surprise阈值（超过此值才加入记忆）
+  recency_weight: 0.6              # 近期性权重 (α)
+  frequency_weight: 0.4            # 频率权重 (β)
+
+  # 原型聚合参数
+  enable_prototype_aggregation: true
+  num_memory_prototypes: 5         # 记忆原型数量（K-Means聚类中心数）
+
+  # 对比学习参数
+  contrastive_lambda: 0.1          # 对比学习损失权重
+  contrastive_temperature: 0.1     # InfoNCE温度参数
+
+# ============================================
+# 联邦学习参数
+# ============================================
+federated:
+  num_rounds: 50                   # 联邦学习轮数
+  client_fraction: 0.1             # 每轮参与的客户端比例
+  local_epochs: 1                  # 客户端本地训练轮数
+  aggregation_method: "fedavg"     # 聚合方法: fedavg, fedprox
+  patience: 10                     # 早停patience
+
+# ============================================
+# 训练参数
+# ============================================
+training:
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 32
+  num_negatives: 100               # 负采样数量
+
+  # 优化器参数
+  optimizer: "adam"
+  momentum: 0.9                    # SGD动量（如果使用SGD）
+  beta1: 0.9                       # Adam beta1
+  beta2: 0.999                     # Adam beta2
+
+# ============================================
+# 评估参数
+# ============================================
+evaluation:
+  k_list: [5, 10, 20]              # Top-K列表
+  metrics: ["HR", "NDCG", "MRR"]   # 评估指标
+
+# ============================================
+# 其他参数
+# ============================================
+misc:
+  device: "cuda"                   # cuda, cpu
+  seed: 42                         # 随机种子
+  save_dir: "checkpoints/fedmem"   # 模型保存目录
+  verbose: true                    # 打印详细训练信息
+
+  # 日志参数
+  log_interval: 10                 # 打印日志间隔（轮数）
+  save_interval: 10                # 保存模型间隔（轮数）
+
+# ============================================
+# 实验变体（用于消融实验）
+# ============================================
+ablation:
+  # 设置为true以禁用相应组件
+  disable_memory: false            # 禁用本地动态记忆
+  disable_prototype_agg: false     # 禁用原型聚合
+  disable_contrastive: false       # 禁用对比学习损失
+  disable_moe: false               # 禁用MoE（仅使用SASRec）
+
+# ============================================
+# 超参数搜索空间（可选）
+# ============================================
+hyperparameter_search:
+  enable: false
+  method: "grid"                   # grid, random, bayesian
+
+  # 搜索空间
+  search_space:
+    memory_capacity: [20, 50, 100]
+    surprise_threshold: [0.3, 0.5, 0.7]
+    contrastive_lambda: [0.05, 0.1, 0.2]
+    learning_rate: [0.0005, 0.001, 0.002]
+    client_fraction: [0.05, 0.1, 0.2]
+
+  # 搜索参数
+  num_trials: 20                   # 搜索次数（random/bayesian）
+  metric: "HR@10"                  # 优化目标指标

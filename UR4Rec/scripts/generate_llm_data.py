@@ -6,6 +6,18 @@
 2. 物品文本描述（基于元数据）
 
 生成后的数据用于训练轻量级检索器
+
+使用方法：
+- 基础用法: python generate_llm_data.py --data_dir data/ --output_dir output/
+- 只生成用户偏好: 添加 --only_users
+- 只生成物品描述: 添加 --only_items
+
+默认配置：
+- 模型: qwen-flash (DashScope)
+- API Key: 从环境变量 DASHSCOPE_API_KEY 读取
+
+物品描述 Prompt:
+使用专门设计的语义密集型 prompt，关注视觉美学、核心主题、情感基调和受众吸引力。
 """
 import sys
 from pathlib import Path
@@ -248,8 +260,8 @@ def generate_item_descriptions(
 def main():
     parser = argparse.ArgumentParser(description='使用 LLM 生成用户偏好和物品描述')
 
-    parser.add_argument('--config', type=str, required=True,
-                        help='配置文件路径')
+    parser.add_argument('--config', type=str, default=None,
+                        help='配置文件路径（可选，当前未使用）')
     parser.add_argument('--data_dir', type=str, required=True,
                         help='数据目录')
     parser.add_argument('--output_dir', type=str, required=True,
@@ -258,10 +270,13 @@ def main():
     parser.add_argument('--llm_backend', type=str, default='openai',
                         choices=['openai', 'anthropic', 'local'],
                         help='LLM 后端')
-    parser.add_argument('--model_name', type=str, default='gpt-3.5-turbo',
+    parser.add_argument('--model_name', type=str, default='qwen-flash',
                         help='LLM 模型名称')
     parser.add_argument('--api_key', type=str, default=None,
-                        help='API 密钥（如果需要）')
+                        help='API 密钥（如果为 None，从环境变量读取）')
+    parser.add_argument('--base_url', type=str,
+                        default='https://dashscope.aliyuncs.com/compatible-mode/v1',
+                        help='API 基础 URL（DashScope 或其他兼容 OpenAI 的服务）')
 
     parser.add_argument('--max_users', type=int, default=None,
                         help='最多生成多少用户（None表示全部）')
@@ -271,6 +286,14 @@ def main():
     parser.add_argument('--min_history_length', type=int, default=3,
                         help='用户最少历史长度')
 
+    # 生成选项：可以选择只生成用户偏好、只生成物品描述，或两者都生成
+    generation_group = parser.add_mutually_exclusive_group()
+    generation_group.add_argument('--only_users', action='store_true',
+                        help='只生成用户偏好（不生成物品描述）')
+    generation_group.add_argument('--only_items', action='store_true',
+                        help='只生成物品描述（不生成用户偏好）')
+
+    # 保留原有的 skip 参数以兼容旧脚本
     parser.add_argument('--skip_users', action='store_true',
                         help='跳过用户偏好生成')
     parser.add_argument('--skip_items', action='store_true',
@@ -286,14 +309,26 @@ def main():
 
     args = parser.parse_args()
 
-    # 加载配置
-    with open(args.config, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
+    # 处理生成选项
+    if args.only_users:
+        args.skip_items = True
+        print("\n模式: 只生成用户偏好")
+    elif args.only_items:
+        args.skip_users = True
+        print("\n模式: 只生成物品描述")
+    else:
+        print("\n模式: 生成用户偏好和物品描述")
+
+    # 加载配置（如果提供）
+    config = {}
+    if args.config:
+        with open(args.config, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        print(f"\n已加载配置文件: {args.config}")
 
     print("=" * 60)
     print("LLM 数据生成")
     print("=" * 60)
-    print(f"配置文件: {args.config}")
     print(f"数据目录: {args.data_dir}")
     print(f"输出目录: {args.output_dir}")
     print(f"LLM 后端: {args.llm_backend}")
@@ -315,20 +350,26 @@ def main():
 
     # 创建 LLM 生成器
     print(f"\n使用 {args.llm_backend} 后端")
+    print(f"模型: {args.model_name}")
+    print(f"API 端点: {args.base_url}")
 
-    # 确保设置了API密钥
-    if args.api_key is None:
-        print("\n错误: 请提供API密钥")
-        print("  使用 --api_key 参数或设置环境变量:")
-        print("  - OpenAI: export OPENAI_API_KEY=your-key")
-        print("  - DashScope: export DASHSCOPE_API_KEY=your-key")
-        print("  - Anthropic: export ANTHROPIC_API_KEY=your-key")
+    # 检查 API 密钥（如果没有通过参数提供，会从环境变量读取）
+    import os
+    api_key = args.api_key or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("\n错误: 请提供 API 密钥")
+        print("  方法 1: 使用 --api_key 参数")
+        print("  方法 2: 设置环境变量:")
+        print("    export DASHSCOPE_API_KEY=your-key")
+        print("    或")
+        print("    export OPENAI_API_KEY=your-key")
         return
 
     generator = LLMPreferenceGenerator(
         llm_backend=args.llm_backend,
         model_name=args.model_name,
-        api_key=args.api_key,
+        api_key=args.api_key,  # 可以是 None，生成器会自动从环境变量读取
+        base_url=args.base_url,
         cache_dir=args.cache_dir
     )
 
@@ -367,11 +408,20 @@ def main():
     print("完成！")
     print("=" * 60)
     print(f"输出目录: {args.output_dir}")
-
+    print("\n生成的文件:")
     if not args.skip_users:
-        print(f"  - user_preferences.json")
+        print(f"  ✓ user_preferences.json (用户偏好)")
     if not args.skip_items:
-        print(f"  - item_descriptions.json")
+        print(f"  ✓ item_descriptions.json (物品描述)")
+
+    if args.skip_users and args.skip_items:
+        print("  (无文件生成 - 已跳过所有选项)")
+
+    print("\n使用方法:")
+    print("  - 生成两者: python generate_llm_data.py --data_dir ... --output_dir ...")
+    print("  - 只生成用户偏好: 添加 --only_users")
+    print("  - 只生成物品描述: 添加 --only_items")
+    print("\n提示: --config 参数现在是可选的（未使用）")
 
 
 if __name__ == "__main__":
