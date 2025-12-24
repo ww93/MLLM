@@ -46,7 +46,9 @@ class FedMemServer:
         patience: int = 10,  # Early stopping
         # FedMem参数
         enable_prototype_aggregation: bool = True,
-        num_memory_prototypes: int = 5
+        num_memory_prototypes: int = 5,
+        # 【策略2】Partial Aggregation
+        partial_aggregation_warmup_rounds: int = 0  # 0表示禁用，>0表示启用
     ):
         """
         Args:
@@ -60,6 +62,7 @@ class FedMemServer:
             patience: 早停patience
             enable_prototype_aggregation: 是否启用原型聚合
             num_memory_prototypes: 记忆原型数量
+            partial_aggregation_warmup_rounds: Warmup轮数，前N轮只聚合SASRec参数（策略2）
         """
         self.global_model = global_model.to(device)
         self.clients = clients
@@ -71,6 +74,7 @@ class FedMemServer:
         self.patience = patience
         self.enable_prototype_aggregation = enable_prototype_aggregation
         self.num_memory_prototypes = num_memory_prototypes
+        self.partial_aggregation_warmup_rounds = partial_aggregation_warmup_rounds
 
         # 聚合器
         self.aggregator = FederatedAggregator(
@@ -270,11 +274,45 @@ class FedMemServer:
         if verbose:
             print(f"聚合客户端模型参数...")
 
-        aggregated_parameters = self.aggregator.aggregate(
-            client_models=client_models,
-            client_weights=client_weights,
-            global_model=global_parameters if self.aggregation_method == "fedprox" else None
-        )
+        # 【策略2】Partial Aggregation - 前N轮只聚合SASRec参数
+        if self.partial_aggregation_warmup_rounds > 0 and round_idx < self.partial_aggregation_warmup_rounds:
+            if verbose:
+                print(f"  [Warmup阶段 {round_idx+1}/{self.partial_aggregation_warmup_rounds}] 只聚合SASRec参数")
+
+            # 过滤客户端模型：只保留sasrec相关参数
+            filtered_client_models = []
+            for client_model in client_models:
+                filtered_model = OrderedDict()
+                for key, value in client_model.items():
+                    # 只保留包含 "sasrec" 的参数，排除 router 和 expert
+                    if "sasrec" in key and "router" not in key and "expert" not in key:
+                        filtered_model[key] = value
+                filtered_client_models.append(filtered_model)
+
+            # 聚合过滤后的参数
+            aggregated_sasrec_params = self.aggregator.aggregate(
+                client_models=filtered_client_models,
+                client_weights=client_weights,
+                global_model=global_parameters if self.aggregation_method == "fedprox" else None
+            )
+
+            # 用聚合后的SASRec参数更新全局参数，保持其他参数不变
+            aggregated_parameters = copy.deepcopy(global_parameters)
+            for key, value in aggregated_sasrec_params.items():
+                aggregated_parameters[key] = value
+
+            if verbose:
+                print(f"  聚合了 {len(aggregated_sasrec_params)} 个SASRec参数（共{len(global_parameters)}个参数）")
+        else:
+            # 正常全量聚合
+            if self.partial_aggregation_warmup_rounds > 0 and verbose:
+                print(f"  [正常阶段] 全量聚合所有参数")
+
+            aggregated_parameters = self.aggregator.aggregate(
+                client_models=client_models,
+                client_weights=client_weights,
+                global_model=global_parameters if self.aggregation_method == "fedprox" else None
+            )
 
         # 6. 【FedMem】聚合记忆原型
         if self.enable_prototype_aggregation and len(client_prototypes) > 0:

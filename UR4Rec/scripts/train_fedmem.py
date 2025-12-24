@@ -468,6 +468,20 @@ def main():
     parser.add_argument("--num_negatives_eval", type=int, default=100,
                         help="评估时的负样本数量（默认100）")
 
+    # 【残差增强】Residual Enhancement 参数
+    parser.add_argument("--gating_init", type=float, default=0.1,
+                        help="门控权重初始值（推荐0.0-0.1），控制辅助信息注入强度")
+
+    # 【策略1】Router Bias Initialization 参数 [已废弃，保留向后兼容]
+    parser.add_argument("--init_bias_for_sasrec", action="store_true",
+                        help="[已废弃] 启用Router Bias Initialization（策略1）")
+    parser.add_argument("--sasrec_bias_value", type=float, default=5.0,
+                        help="[已废弃] SASRec expert的bias初始值")
+
+    # 【策略2】Partial Aggregation 参数
+    parser.add_argument("--partial_aggregation_warmup_rounds", type=int, default=0,
+                        help="Warmup轮数，前N轮只聚合SASRec参数（策略2），0表示禁用")
+
     # 其他参数
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="计算设备")
@@ -551,8 +565,13 @@ def main():
         moe_num_heads=args.moe_num_heads,
         moe_dropout=0.1,
         router_hidden_dim=128,
+        # 残差增强参数
+        gating_init=args.gating_init,
         # 负载均衡
         load_balance_lambda=0.01,
+        # 【策略1】Router Bias Initialization [已废弃，保留向后兼容]
+        init_bias_for_sasrec=args.init_bias_for_sasrec,
+        sasrec_bias_value=args.sasrec_bias_value,
         # 设备
         device=args.device
     )
@@ -593,7 +612,9 @@ def main():
         patience=args.patience,
         # FedMem参数
         enable_prototype_aggregation=args.enable_prototype_aggregation,
-        num_memory_prototypes=args.num_memory_prototypes
+        num_memory_prototypes=args.num_memory_prototypes,
+        # 【策略2】Partial Aggregation
+        partial_aggregation_warmup_rounds=args.partial_aggregation_warmup_rounds
     )
 
     # 开始训练（传递user_sequences用于负采样评估）

@@ -243,26 +243,27 @@ class SemanticExpert(nn.Module):
 
 class ItemCentricRouter(nn.Module):
     """
-    以物品为中心的路由器
+    以物品为中心的路由器（Residual Enhancement版本）
 
-    根据目标物品的嵌入表示，动态决定三个专家的权重:
-    - 序列专家 (Sequential Expert)
+    根据目标物品的嵌入表示，动态决定辅助专家的权重:
     - 视觉专家 (Visual Expert)
     - 语义专家 (Semantic Expert)
+
+    注意: SASRec不再参与路由竞争，而是作为骨干直接保留
     """
 
     def __init__(
         self,
         item_emb_dim: int,
         hidden_dim: int = 128,
-        num_experts: int = 3,
+        num_experts: int = 2,  # 现在只有2个辅助专家: Visual, Semantic
         dropout: float = 0.1
     ):
         """
         Args:
             item_emb_dim: 物品嵌入维度
             hidden_dim: 隐藏层维度
-            num_experts: 专家数量 (默认3: Seq, Vis, Sem)
+            num_experts: 专家数量 (现在固定为2: Visual, Semantic)
             dropout: Dropout率
         """
         super().__init__()
@@ -278,7 +279,7 @@ class ItemCentricRouter(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, num_experts),
+            nn.Linear(hidden_dim // 2, num_experts),  # 输出2个权重
             nn.Softmax(dim=-1)
         )
 
@@ -293,26 +294,27 @@ class ItemCentricRouter(nn.Module):
             target_item_emb: 目标物品嵌入 [B, item_emb_dim] or [B, N, item_emb_dim]
 
         Returns:
-            weights: 专家权重 [B, num_experts] or [B, N, num_experts]
+            weights: 辅助专家权重 [B, 2] or [B, N, 2] (Visual, Semantic)
         """
-        weights = self.router(target_item_emb)  # [B, 3] or [B, N, 3]
+        weights = self.router(target_item_emb)  # [B, 2] or [B, N, 2]
         return weights
 
 
 class UR4RecV2MoE(nn.Module):
     """
-    FedDMMR: Scenario-Adaptive Heterogeneous Mixture-of-Experts
+    FedDMMR: Residual Enhancement with Heterogeneous MoE
 
-    架构:
-    1. SASRec骨干: 序列模式建模
+    架构（Residual Enhancement版本）:
+    1. SASRec骨干: 序列模式建模（保留为基础表示）
     2. VisualExpert: 视觉特征专家 (基于多模态记忆)
     3. SemanticExpert: 语义特征专家 (基于文本记忆)
-    4. ItemCentricRouter: 以物品为中心的动态路由
+    4. ItemCentricRouter: 路由器（仅控制辅助专家权重）
+    5. Gating Weight: 可学习的门控权重，控制辅助信息注入
 
     创新点:
-    - 场景自适应: 路由器根据目标物品动态调整专家权重
-    - 异构MoE: 不同专家处理不同模态的特征
-    - 记忆增强: 专家从本地动态记忆中检索相关信息
+    - 残差增强: SASRec输出直接保留，辅助专家提供增量信息
+    - 场景自适应: 路由器根据目标物品动态调整辅助专家权重
+    - 可控融合: 通过可学习的gating weight控制多模态信息注入强度
     """
 
     def __init__(
@@ -332,13 +334,18 @@ class UR4RecV2MoE(nn.Module):
         moe_num_heads: int = 4,     # SemanticExpert的注意力头数
         moe_dropout: float = 0.1,
         router_hidden_dim: int = 128,
+        # 残差增强参数
+        gating_init: float = 0.1,   # Gating weight初始值
         # 负载均衡
         load_balance_lambda: float = 0.01,  # 负载均衡损失权重
+        # 【已废弃】Router Bias Initialization (不再需要，因为SASRec不参与竞争)
+        init_bias_for_sasrec: bool = False,
+        sasrec_bias_value: float = 5.0,
         # 设备
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         """
-        初始化FedDMMR模型
+        初始化FedDMMR模型（Residual Enhancement版本）
 
         Args:
             num_items: 物品总数
@@ -350,7 +357,10 @@ class UR4RecV2MoE(nn.Module):
             moe_num_heads: 语义专家的多头注意力头数
             moe_dropout: MoE模块的dropout率
             router_hidden_dim: 路由器隐藏层维度
+            gating_init: Gating weight初始值（推荐0.0-0.1）
             load_balance_lambda: 负载均衡损失权重
+            init_bias_for_sasrec: [已废弃] 不再使用
+            sasrec_bias_value: [已废弃] 不再使用
             device: 运行设备
         """
         super().__init__()
@@ -401,14 +411,31 @@ class UR4RecV2MoE(nn.Module):
         )
 
         # ===========================
-        # 4. 以物品为中心的路由器
+        # 4. 以物品为中心的路由器（仅控制辅助专家）
         # ===========================
         self.router = ItemCentricRouter(
             item_emb_dim=sasrec_hidden_dim,
             hidden_dim=router_hidden_dim,
-            num_experts=3,  # Seq, Vis, Sem
+            num_experts=2,  # 只有2个辅助专家: Visual, Semantic
             dropout=moe_dropout
         )
+
+        # ===========================
+        # 5. LayerNorm for each expert output
+        # ===========================
+        self.seq_layernorm = nn.LayerNorm(sasrec_hidden_dim)
+        self.vis_layernorm = nn.LayerNorm(moe_hidden_dim)
+        self.sem_layernorm = nn.LayerNorm(moe_hidden_dim)
+
+        # ===========================
+        # 6. Gating Weight (可学习的门控参数)
+        # ===========================
+        self.gating_weight = nn.Parameter(torch.tensor(gating_init))
+
+        print(f"✓ Residual Enhancement 架构初始化:")
+        print(f"  Gating Weight 初始值: {gating_init}")
+        print(f"  Router 控制专家数: 2 (Visual, Semantic)")
+        print(f"  SASRec 作为骨干直接保留")
 
         self.to(device)
 
@@ -532,61 +559,52 @@ class UR4RecV2MoE(nn.Module):
             sem_out = torch.zeros(batch_size, num_candidates, self.moe_hidden_dim, device=self.device)
 
         # ===========================
-        # 4. 路由与表示级融合 (Representation-Level Fusion)
+        # 4. 残差增强融合 (Residual Enhancement Fusion)
         # ===========================
-        # 获取路由权重 (基于目标物品嵌入)
-        router_weights = self.router(target_item_embs)  # [B, N, 3]
+        # 应用LayerNorm到所有专家输出
+        seq_out_norm = self.seq_layernorm(seq_out)    # [B, N, D]
+        vis_out_norm = self.vis_layernorm(vis_out)    # [B, N, D]
+        sem_out_norm = self.sem_layernorm(sem_out)    # [B, N, D]
+
+        # 获取路由权重 (仅对辅助专家: Visual, Semantic)
+        router_weights = self.router(target_item_embs)  # [B, N, 2]
 
         # 【修复】根据专家可用性调整权重，避免给零专家分配权重导致信息稀释
         expert_available = torch.tensor([
-            1.0,  # seq always available
-            1.0 if (memory_visual is not None and target_visual is not None) else 0.0,
-            1.0 if memory_text is not None else 0.0
+            1.0 if (memory_visual is not None and target_visual is not None) else 0.0,  # Visual
+            1.0 if memory_text is not None else 0.0  # Semantic
         ], device=router_weights.device)
 
         # 将不可用专家的权重mask掉并重新归一化
-        router_weights = router_weights * expert_available.view(1, 1, 3)
+        router_weights = router_weights * expert_available.view(1, 1, 2)
         router_weights = router_weights / (router_weights.sum(dim=-1, keepdim=True) + 1e-10)
 
-        # 提取三个专家的权重
-        w_seq = router_weights[:, :, 0].unsqueeze(2)  # [B, N, 1]
-        w_vis = router_weights[:, :, 1].unsqueeze(2)  # [B, N, 1]
-        w_sem = router_weights[:, :, 2].unsqueeze(2)  # [B, N, 1]
+        # 提取辅助专家的权重
+        w_vis = router_weights[:, :, 0].unsqueeze(2)  # [B, N, 1]
+        w_sem = router_weights[:, :, 1].unsqueeze(2)  # [B, N, 1]
 
-        # 【关键改动】表示级融合：先加权融合专家输出向量
-        # 而不是融合分数（这符合ACL论文方法）
-        fused_repr = (
-            w_seq * seq_out +    # [B, N, D]
-            w_vis * vis_out +    # [B, N, D]
-            w_sem * sem_out      # [B, N, D]
-        )  # [B, N, D]
+        # 【残差增强融合】SASRec骨干保留，辅助专家提供增量信息
+        # Formula: final_repr = seq_out + gating * (w_vis * vis_out + w_sem * sem_out)
+        auxiliary_repr = w_vis * vis_out_norm + w_sem * sem_out_norm  # [B, N, D]
+        fused_repr = seq_out_norm + self.gating_weight * auxiliary_repr  # [B, N, D]
 
-        # 【修复】L2归一化，使用余弦相似度计算得分
-        # 原因：融合后的表示和target_item_embs可能在不同的表示空间，且norm差异很大
-        # 归一化可以消除magnitude差异，只关注方向相似度
-        #
-        # 【验证结果】移除L2归一化后性能更差（HR@10: 4.67% → 1.48%）
-        # 说明L2归一化是必要的，真正的问题在于：
-        #   1. 专家输出的表示空间不统一
-        #   2. 可能的模型初始化问题
-        #   3. 可能的训练动态问题
+        # L2归一化，使用余弦相似度计算得分
         fused_repr_norm = torch.nn.functional.normalize(fused_repr, p=2, dim=-1)  # [B, N, D]
         target_item_embs_norm = torch.nn.functional.normalize(target_item_embs, p=2, dim=-1)  # [B, N, D]
 
-        # 计算最终得分：归一化后的余弦相似度（范围[-1, 1]）
-        # 乘以scale factor以扩大得分范围，便于训练
-        scale = self.sasrec_hidden_dim ** 0.5  # 常见的scale factor (如Transformer)
+        # 计算最终得分：归一化后的余弦相似度
+        scale = self.sasrec_hidden_dim ** 0.5
         final_scores = scale * (fused_repr_norm * target_item_embs_norm).sum(dim=-1)  # [B, N]
 
         # ===========================
         # 5. 负载均衡损失
         # ===========================
-        # 计算每个专家的平均使用率
-        expert_usage = router_weights.mean(dim=[0, 1])  # [3]
+        # 计算每个辅助专家的平均使用率
+        expert_usage = router_weights.mean(dim=[0, 1])  # [2]
 
-        # 负载均衡损失: 鼓励专家均匀使用
+        # 负载均衡损失: 鼓励辅助专家均匀使用
         # L_lb = Σ(usage_i - 1/N)^2
-        target_usage = 1.0 / 3.0  # 均匀分配
+        target_usage = 1.0 / 2.0  # 均匀分配给2个辅助专家
         lb_loss = torch.sum((expert_usage - target_usage) ** 2)
 
         # ===========================
@@ -594,25 +612,29 @@ class UR4RecV2MoE(nn.Module):
         # ===========================
         if return_components:
             # 为了调试和分析，也计算各专家单独的分数
-            seq_scores = (seq_out * target_item_embs).sum(dim=-1)  # [B, N]
-            vis_scores = (vis_out * target_item_embs).sum(dim=-1)  # [B, N]
-            sem_scores = (sem_out * target_item_embs).sum(dim=-1)  # [B, N]
+            seq_scores = (seq_out_norm * target_item_embs_norm).sum(dim=-1) * scale  # [B, N]
+            vis_scores = (vis_out_norm * target_item_embs_norm).sum(dim=-1) * scale  # [B, N]
+            sem_scores = (sem_out_norm * target_item_embs_norm).sum(dim=-1) * scale  # [B, N]
 
             info = {
-                'seq_scores': seq_scores,           # 序列专家单独得分（仅供分析）
+                'seq_scores': seq_scores,           # 序列骨干单独得分（仅供分析）
                 'vis_scores': vis_scores,           # 视觉专家单独得分（仅供分析）
                 'sem_scores': sem_scores,           # 语义专家单独得分（仅供分析）
                 'final_scores': final_scores,       # 融合后的最终得分
-                'router_weights': router_weights,   # [B, N, 3] 路由权重
-                'expert_usage': expert_usage,       # [3] 专家使用率
+                'router_weights': router_weights,   # [B, N, 2] 辅助专家路由权重
+                'expert_usage': expert_usage,       # [2] 辅助专家使用率
                 'lb_loss': lb_loss,                 # 负载均衡损失
-                'w_seq': w_seq.mean().item(),       # 序列专家平均权重
                 'w_vis': w_vis.mean().item(),       # 视觉专家平均权重
                 'w_sem': w_sem.mean().item(),       # 语义专家平均权重
-                # 新增：表示向量信息
-                'seq_out': seq_out,                 # [B, N, D] 序列专家表示
+                'gating_weight': self.gating_weight.item(),  # 门控权重
+                # 表示向量信息
+                'seq_out': seq_out,                 # [B, N, D] 序列骨干表示
                 'vis_out': vis_out,                 # [B, N, D] 视觉专家表示
                 'sem_out': sem_out,                 # [B, N, D] 语义专家表示
+                'seq_out_norm': seq_out_norm,       # [B, N, D] 归一化后的序列表示
+                'vis_out_norm': vis_out_norm,       # [B, N, D] 归一化后的视觉表示
+                'sem_out_norm': sem_out_norm,       # [B, N, D] 归一化后的语义表示
+                'auxiliary_repr': auxiliary_repr,   # [B, N, D] 辅助表示
                 'fused_repr': fused_repr            # [B, N, D] 融合后的表示
             }
             return final_scores, info
