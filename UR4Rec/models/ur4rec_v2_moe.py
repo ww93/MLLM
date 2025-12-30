@@ -334,8 +334,8 @@ class UR4RecV2MoE(nn.Module):
         moe_num_heads: int = 4,     # SemanticExpert的注意力头数
         moe_dropout: float = 0.1,
         router_hidden_dim: int = 128,
-        # 残差增强参数
-        gating_init: float = 0.1,   # Gating weight初始值
+        # [FIX 1] 残差增强参数 - 已移除可学习gating，确保完整梯度流
+        gating_init: float = 1.0,   # 保留参数以保持向后兼容（不再使用）
         # 负载均衡
         load_balance_lambda: float = 0.01,  # 负载均衡损失权重
         # 【已废弃】Router Bias Initialization (不再需要，因为SASRec不参与竞争)
@@ -427,15 +427,15 @@ class UR4RecV2MoE(nn.Module):
         self.vis_layernorm = nn.LayerNorm(moe_hidden_dim)
         self.sem_layernorm = nn.LayerNorm(moe_hidden_dim)
 
-        # ===========================
-        # 6. Gating Weight (可学习的门控参数)
-        # ===========================
-        self.gating_weight = nn.Parameter(torch.tensor(gating_init))
+        # [FIX 1] 移除可学习的gating_weight，确保辅助专家接收完整梯度
+        # 原因: gating_weight初始化为0.1会导致辅助专家的梯度缩小到10%，严重阻碍学习
+        # 修复: 直接使用 seq_out + auxiliary_repr，不再使用可学习门控参数
 
-        print(f"✓ Residual Enhancement 架构初始化:")
-        print(f"  Gating Weight 初始值: {gating_init}")
+        print(f"✓ Residual Enhancement 架构初始化 [已修复梯度流]:")
+        print(f"  融合方式: seq_out + (w_vis * vis_out + w_sem * sem_out)")
         print(f"  Router 控制专家数: 2 (Visual, Semantic)")
         print(f"  SASRec 作为骨干直接保留")
+        print(f"  ⚠️  已移除gating_weight参数，确保辅助专家接收完整梯度")
 
         self.to(device)
 
@@ -509,7 +509,13 @@ class UR4RecV2MoE(nn.Module):
             ).squeeze(1)  # [B, N]
 
             if return_components:
-                return final_scores, {'lb_loss': torch.tensor(0.0, device=self.device)}
+                # 创建零张量作为vis_out和sem_out（用于漂移自适应对比学习）
+                zero_out = torch.zeros(batch_size, num_candidates, self.moe_hidden_dim, device=self.device)
+                return final_scores, {
+                    'lb_loss': torch.tensor(0.0, device=self.device),
+                    'vis_out': zero_out,  # [B, N, D] 零张量
+                    'sem_out': zero_out   # [B, N, D] 零张量
+                }
             return final_scores
 
         # ===========================
@@ -583,10 +589,11 @@ class UR4RecV2MoE(nn.Module):
         w_vis = router_weights[:, :, 0].unsqueeze(2)  # [B, N, 1]
         w_sem = router_weights[:, :, 1].unsqueeze(2)  # [B, N, 1]
 
-        # 【残差增强融合】SASRec骨干保留，辅助专家提供增量信息
-        # Formula: final_repr = seq_out + gating * (w_vis * vis_out + w_sem * sem_out)
+        # [FIX 1] 残差增强融合：确保辅助专家接收完整梯度
+        # 修复前: fused_repr = seq_out + gating_weight * auxiliary_repr  (gating_weight=0.1 杀死梯度)
+        # 修复后: fused_repr = seq_out + auxiliary_repr  (完整梯度流)
         auxiliary_repr = w_vis * vis_out_norm + w_sem * sem_out_norm  # [B, N, D]
-        fused_repr = seq_out_norm + self.gating_weight * auxiliary_repr  # [B, N, D]
+        fused_repr = seq_out_norm + auxiliary_repr  # [B, N, D] - 完整梯度
 
         # L2归一化，使用余弦相似度计算得分
         fused_repr_norm = torch.nn.functional.normalize(fused_repr, p=2, dim=-1)  # [B, N, D]
@@ -626,7 +633,7 @@ class UR4RecV2MoE(nn.Module):
                 'lb_loss': lb_loss,                 # 负载均衡损失
                 'w_vis': w_vis.mean().item(),       # 视觉专家平均权重
                 'w_sem': w_sem.mean().item(),       # 语义专家平均权重
-                'gating_weight': self.gating_weight.item(),  # 门控权重
+                # [FIX 1] 已移除gating_weight参数
                 # 表示向量信息
                 'seq_out': seq_out,                 # [B, N, D] 序列骨干表示
                 'vis_out': vis_out,                 # [B, N, D] 视觉专家表示
@@ -716,6 +723,77 @@ class UR4RecV2MoE(nn.Module):
         seq_output = self.sasrec(input_seq, padding_mask=padding_mask)  # [B, L, D]
         seq_repr = seq_output[:, -1, :]  # [B, D]
         return seq_repr
+
+    def compute_contrastive_loss(
+        self,
+        vis_repr: torch.Tensor,
+        sem_repr: torch.Tensor,
+        surprise_score: Optional[torch.Tensor] = None,
+        base_temp: float = 0.07,
+        alpha: float = 0.5
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        [FIX 2] 计算漂移自适应对比学习损失 (Drift-Adaptive Contrastive Loss)
+
+        核心修复:
+        - 修复前: 高surprise导致高temperature，使损失变小，告诉模型"忽略"困难样本
+        - 修复后: 固定temperature，高surprise增加实例权重，告诉模型"关注"困难样本
+
+        Args:
+            vis_repr: 视觉专家表示 [Batch, Dim]
+            sem_repr: 语义专家表示 [Batch, Dim]
+            surprise_score: 惊讶度分数 [Batch] (归一化的标量，表示漂移/错误程度)
+                           如果为None，则返回None权重
+            base_temp: 固定温度 (默认0.07)
+            alpha: 权重调节系数 (默认0.5)
+
+        Returns:
+            contrastive_loss: InfoNCE对比学习损失 (标量)
+            instance_weights: 实例级损失权重 [Batch] 或 None
+                            weights = 1.0 + alpha * surprise_score
+                            高surprise的样本获得更高权重
+
+        修复原理:
+            - 修复前: temp↑ → loss↓ → 梯度↓ → 困难样本被忽略
+            - 修复后: weight↑ → loss×weight↑ → 梯度↑ → 困难样本被强化学习
+        """
+        batch_size = vis_repr.size(0)
+
+        # 步骤1: L2归一化表示向量
+        vis_repr_norm = F.normalize(vis_repr, p=2, dim=-1)  # [B, D]
+        sem_repr_norm = F.normalize(sem_repr, p=2, dim=-1)  # [B, D]
+
+        # 步骤2: 计算相似度矩阵 (余弦相似度)
+        similarity = torch.mm(vis_repr_norm, sem_repr_norm.t())  # [B, B]
+
+        # [FIX 2] 步骤3: 使用固定温度（不再自适应）
+        logits = similarity / base_temp  # [B, B]
+
+        # 步骤4: InfoNCE损失 (逐样本计算，不使用reduction='mean')
+        labels = torch.arange(batch_size, device=vis_repr.device)  # [B]
+
+        # 计算交叉熵损失（双向对比，返回每个样本的损失）
+        loss_vis2sem = F.cross_entropy(logits, labels, reduction='none')  # [B]
+        loss_sem2vis = F.cross_entropy(logits.t(), labels, reduction='none')  # [B]
+
+        # 平均两个方向的损失（保持[B]维度）
+        per_sample_loss = (loss_vis2sem + loss_sem2vis) / 2.0  # [B]
+
+        # [FIX 2] 步骤5: 计算实例级权重
+        if surprise_score is not None:
+            # 确保surprise_score是[B]形状
+            if surprise_score.dim() == 0:
+                surprise_score = surprise_score.unsqueeze(0).expand(batch_size)
+
+            # 计算权重: 高surprise → 高权重 → 强化学习
+            instance_weights = 1.0 + alpha * surprise_score  # [B]
+        else:
+            instance_weights = None
+
+        # 返回未加权的平均损失和实例权重（在外部应用）
+        contrastive_loss = per_sample_loss.mean()  # 标量
+
+        return contrastive_loss, instance_weights
 
 
 __all__ = ['UR4RecV2MoE', 'VisualExpert', 'SemanticExpert', 'ItemCentricRouter']

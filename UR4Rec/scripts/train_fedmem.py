@@ -400,15 +400,15 @@ def main():
     parser = argparse.ArgumentParser(description="FedMem训练脚本（支持多模态）")
 
     # 数据参数
-    parser.add_argument("--data_dir", type=str, default="data/ml-1m",
+    parser.add_argument("--data_dir", type=str, default="UR4Rec/data/ml-1m",
                         help="数据目录")
-    parser.add_argument("--data_file", type=str, default="ratings.dat",
+    parser.add_argument("--data_file", type=str, default="subset_ratings.dat",
                         help="交互数据文件名")
 
     # [NEW] 多模态特征文件参数
-    parser.add_argument("--visual_file", type=str, default=None,
+    parser.add_argument("--visual_file", type=str, default="clip_features.pt",
                         help="视觉特征文件名 (e.g., 'item_images.npy' or 'item_images.pt')")
-    parser.add_argument("--text_file", type=str, default=None,
+    parser.add_argument("--text_file", type=str, default="text_features.pt",
                         help="文本特征文件名 (e.g., 'item_llm_texts.npy' or 'item_llm_texts.pt')")
 
     # 模型参数
@@ -442,7 +442,7 @@ def main():
     # 联邦学习参数
     parser.add_argument("--num_rounds", type=int, default=50,
                         help="联邦学习轮数")
-    parser.add_argument("--client_fraction", type=float, default=0.2,
+    parser.add_argument("--client_fraction", type=float, default=0.1,
                         help="每轮参与的客户端比例")
     parser.add_argument("--local_epochs", type=int, default=1,
                         help="客户端本地训练轮数")
@@ -479,7 +479,7 @@ def main():
                         help="[已废弃] SASRec expert的bias初始值")
 
     # 【策略2】Partial Aggregation 参数
-    parser.add_argument("--partial_aggregation_warmup_rounds", type=int, default=0,
+    parser.add_argument("--partial_aggregation_warmup_rounds", type=int, default=20,
                         help="Warmup轮数，前N轮只聚合SASRec参数（策略2），0表示禁用")
 
     # 其他参数
@@ -491,6 +491,10 @@ def main():
                         help="模型保存目录")
     parser.add_argument("--verbose", action="store_true",
                         help="打印详细训练信息")
+
+    # [NEW] 预训练权重加载
+    parser.add_argument("--pretrained_path", type=str, default=None,
+                        help="预训练模型路径（用于迁移学习）。加载SASRec骨干权重，跳过Warmup阶段")
 
     args = parser.parse_args()
 
@@ -580,6 +584,62 @@ def main():
     print(f"  总参数数量: {sum(p.numel() for p in global_model.parameters()):,}")
     trainable_params = sum(p.numel() for p in global_model.parameters() if p.requires_grad)
     print(f"  可训练参数: {trainable_params:,}")
+
+    # ============================================
+    # 2.5. [NEW] 加载预训练权重（可选）
+    # ============================================
+    if args.pretrained_path is not None:
+        print(f"\n[2.5/4] 加载预训练权重...")
+        print(f"  路径: {args.pretrained_path}")
+
+        if os.path.exists(args.pretrained_path):
+            try:
+                # 加载预训练模型（PyTorch 2.6+需要weights_only=False来加载包含numpy对象的checkpoint）
+                pretrained_state = torch.load(args.pretrained_path, map_location=args.device, weights_only=False)
+
+                # 只加载SASRec骨干权重（兼容性加载）
+                current_state = global_model.state_dict()
+                loaded_keys = []
+                skipped_keys = []
+
+                for key, value in pretrained_state.items():
+                    # 优先加载SASRec相关参数
+                    if 'sasrec' in key.lower() or 'item_emb' in key.lower():
+                        if key in current_state and current_state[key].shape == value.shape:
+                            current_state[key] = value
+                            loaded_keys.append(key)
+                        else:
+                            skipped_keys.append(key)
+                    # 可选：加载Router和LayerNorm（如果形状匹配）
+                    elif 'router' in key.lower() or 'layernorm' in key.lower():
+                        if key in current_state and current_state[key].shape == value.shape:
+                            current_state[key] = value
+                            loaded_keys.append(key)
+                        else:
+                            skipped_keys.append(key)
+                    else:
+                        skipped_keys.append(key)
+
+                # 应用加载的权重
+                global_model.load_state_dict(current_state)
+
+                print(f"  ✓ 成功加载 {len(loaded_keys)} 个参数")
+                print(f"    主要模块: SASRec骨干、Item嵌入、Router")
+                if len(skipped_keys) > 0:
+                    print(f"  ⚠️  跳过 {len(skipped_keys)} 个参数（形状不匹配或非骨干参数）")
+
+                # 重要提示
+                print(f"\n  📌 预训练权重已加载，建议:")
+                print(f"    - 使用较小的学习率（如1e-4, 当前{args.learning_rate}）")
+                print(f"    - 减少训练轮数（当前{args.num_rounds}轮）")
+                print(f"    - 直接跳过Warmup（设置partial_aggregation_warmup_rounds=0）")
+
+            except Exception as e:
+                print(f"  ✗ 加载预训练权重失败: {e}")
+                print(f"  将使用随机初始化继续训练")
+        else:
+            print(f"  ✗ 预训练权重文件不存在: {args.pretrained_path}")
+            print(f"  将使用随机初始化继续训练")
 
     # ============================================
     # 3. [UPDATED] 创建FedMem客户端（传入多模态特征）
