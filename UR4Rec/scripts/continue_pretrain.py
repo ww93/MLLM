@@ -30,8 +30,10 @@ def main():
     print("="*60)
     print()
 
-    # 检查checkpoint是否存在
-    checkpoint_path = "UR4Rec/checkpoints/fedsasrec_pretrain/fedmem_model.pt"
+    # 检查checkpoint是否存在（使用绝对路径）
+    script_dir = Path(__file__).parent.parent  # UR4Rec目录
+    checkpoint_path = str(script_dir / "checkpoints" / "fedsasrec_pretrain" / "fedmem_model.pt")
+
     if not os.path.exists(checkpoint_path):
         print(f"❌ 错误: Checkpoint不存在: {checkpoint_path}")
         print(f"请先运行初始预训练:")
@@ -64,16 +66,16 @@ def main():
         "num_memory_prototypes": 5,
 
         # [关键] 联邦学习参数 - 继续训练10轮
-        "num_rounds": 15,  # 额外训练10轮（总共15+10=25轮）
+        "num_rounds": 10,  # 额外训练10轮（总共15+10=25轮）
         "client_fraction": 0.2,
         "local_epochs": 1,
         "patience": 10,
 
-        # 训练参数（保持一致）
-        "learning_rate": 5e-3,  # 保持大学习率
+        # [FIX] 训练参数 - 降低学习率用于继续训练
+        "learning_rate": 1e-3,  # 从5e-3降低到1e-3（已经训练15轮，需要更小的学习率）
         "weight_decay": 1e-5,
         "batch_size": 64,
-        "num_negatives": 100,
+        "num_negatives": 4,  # [加速优化3] 训练时仅用4个负样本（评估时仍用100个）
 
         # 评估参数
         "use_negative_sampling": "true",
@@ -85,6 +87,9 @@ def main():
         # [NEW] 从checkpoint加载
         "pretrained_path": checkpoint_path,
 
+        # [FIX] 跳过Warmup阶段（已经预训练15轮，直接全量聚合）
+        "partial_aggregation_warmup_rounds": 0,
+
         # 其他参数
         "seed": 42,
         "save_dir": "UR4Rec/checkpoints/fedsasrec_pretrain",  # 保存到同一位置（覆盖）
@@ -95,14 +100,20 @@ def main():
     print(f"  加载checkpoint: {checkpoint_path}")
     print(f"  继续训练轮数: {config['num_rounds']} (额外)")
     print(f"  总轮数: 15 + {config['num_rounds']} = 25")
-    print(f"  学习率: {config['learning_rate']} (保持不变)")
+    print(f"  学习率: {config['learning_rate']} (从5e-3降低到1e-3)")
     print(f"  客户端比例: {config['client_fraction']}")
+    print(f"  Warmup轮数: {config['partial_aggregation_warmup_rounds']} (跳过)")
+    print()
+    print("关键修复:")
+    print(f"  ✅ 使用绝对路径加载checkpoint（避免路径错误）")
+    print(f"  ✅ 降低学习率到1e-3（避免训练不稳定）")
+    print(f"  ✅ 跳过Warmup阶段（已完成预训练）")
     print()
     print("预期效果:")
-    print(f"  当前HR@10: 0.36")
+    print(f"  当前HR@10: 0.36 (15轮后)")
     print(f"  目标HR@10: 0.50-0.55 (25轮后)")
     print()
-    print("⏱️  预计时长: 20-30分钟")
+    print("⏱️  预计时长: 15-20分钟")
     print()
 
     # 构建命令

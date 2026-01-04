@@ -303,13 +303,17 @@ class FederatedAggregator:
             # 聚合后的参数值
             agg_param = aggregated_model[key].flatten()
 
+            # 确保所有参数在同一设备上（与聚合后的模型保持一致）
+            device = agg_param.device
+            param_values_same_device = [p.to(device) for p in param_values]
+
             # 计算平均距离
-            for param_val in param_values:
+            for param_val in param_values_same_device:
                 distance = torch.norm(param_val - agg_param).item()
                 total_distance += distance
 
             # 计算方差
-            param_tensor = torch.stack(param_values)
+            param_tensor = torch.stack(param_values_same_device)
             variance = torch.var(param_tensor, dim=0).mean().item()
             total_variance += variance
 

@@ -234,6 +234,13 @@ class FedMemClient:
                 lr=self.learning_rate,
                 weight_decay=self.weight_decay
             )
+            # [加速优化1] 初始化混合精度训练的GradScaler
+            # 兼容字符串和torch.device对象
+            device_type = self.device if isinstance(self.device, str) else self.device.type
+            if device_type == 'cuda':
+                self.scaler = torch.cuda.amp.GradScaler()
+            else:
+                self.scaler = None
 
     def release_model(self):
         """释放模型内存"""
@@ -340,39 +347,41 @@ class FedMemClient:
                 ], dim=1)  # [B, 1+N]
 
                 # ===========================
-                # 前向传播（FedDMMR）
+                # [加速优化1] 前向传播（FedDMMR） - 使用混合精度
                 # ===========================
-                # 【NEW】从本地记忆检索多模态特征
-                memory_visual, memory_text = self._retrieve_multimodal_memory_batch(
-                    batch_size=batch_size,
-                    top_k=20
-                )
+                # 使用autocast自动选择合适的精度
+                with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
+                    # 【NEW】从本地记忆检索多模态特征
+                    memory_visual, memory_text = self._retrieve_multimodal_memory_batch(
+                        batch_size=batch_size,
+                        top_k=20
+                    )
 
-                # 【NEW】获取候选物品的多模态特征
-                target_visual = self._get_candidate_visual_features(all_candidates)
-                target_text = self._get_candidate_text_features(all_candidates)
+                    # 【NEW】获取候选物品的多模态特征
+                    target_visual = self._get_candidate_visual_features(all_candidates)
+                    target_text = self._get_candidate_text_features(all_candidates)
 
-                # 【NEW】使用FedDMMR的新forward接口
-                final_scores, info = self.model(
-                    user_ids=user_ids,
-                    input_seq=item_seqs,
-                    target_items=all_candidates,
-                    memory_visual=memory_visual,    # [B, 20, img_dim] 或 None
-                    memory_text=memory_text,        # [B, 20, text_dim] 或 None
-                    target_visual=target_visual,    # [B, N, img_dim] 或 None
-                    target_text=target_text,        # [B, N, text_dim] 或 None
-                    return_components=True  # 需要获取lb_loss
-                )
+                    # 【NEW】使用FedDMMR的新forward接口
+                    final_scores, info = self.model(
+                        user_ids=user_ids,
+                        input_seq=item_seqs,
+                        target_items=all_candidates,
+                        memory_visual=memory_visual,    # [B, 20, img_dim] 或 None
+                        memory_text=memory_text,        # [B, 20, text_dim] 或 None
+                        target_visual=target_visual,    # [B, N, img_dim] 或 None
+                        target_text=target_text,        # [B, N, text_dim] 或 None
+                        return_components=True  # 需要获取lb_loss
+                    )
 
-                # 提取负载均衡损失和中间表示
-                lb_loss = info['lb_loss']
-                vis_out = info['vis_out']  # [B, 1+N, D] 视觉专家输出
-                sem_out = info['sem_out']  # [B, 1+N, D] 语义专家输出
+                    # 提取负载均衡损失和中间表示
+                    lb_loss = info['lb_loss']
+                    vis_out = info['vis_out']  # [B, 1+N, D] 视觉专家输出
+                    sem_out = info['sem_out']  # [B, 1+N, D] 语义专家输出
 
-                # 计算推荐损失（使用BPR loss）
-                # all_candidates: [B, 1+N]，第0列是正样本，其余是负样本
-                labels = torch.zeros(batch_size, dtype=torch.long, device=self.device)  # 正样本索引都是0
-                rec_loss, _ = self.model.compute_loss(final_scores, labels, lb_loss=None)
+                    # 计算推荐损失（使用BPR loss）
+                    # all_candidates: [B, 1+N]，第0列是正样本，其余是负样本
+                    labels = torch.zeros(batch_size, dtype=torch.long, device=self.device)  # 正样本索引都是0
+                    rec_loss, _ = self.model.compute_loss(final_scores, labels, lb_loss=None)
 
                 # ===========================
                 # 计算惊讶度分数 (Surprise Score)
@@ -388,44 +397,54 @@ class FedMemClient:
                 # ===========================
                 # [FIX 2] 计算漂移自适应对比学习损失 (Drift-Adaptive Contrastive Loss)
                 # ===========================
-                # 提取正样本（第0个候选物品）的视觉和语义表示
-                vis_pos = vis_out[:, 0, :]  # [B, D] 正样本的视觉表示
-                sem_pos = sem_out[:, 0, :]  # [B, D] 正样本的语义表示
+                with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
+                    # 提取正样本（第0个候选物品）的视觉和语义表示
+                    vis_pos = vis_out[:, 0, :]  # [B, D] 正样本的视觉表示
+                    sem_pos = sem_out[:, 0, :]  # [B, D] 正样本的语义表示
 
-                # 调用模型的compute_contrastive_loss方法
-                # [FIX 2] 修复: 不再使用自适应温度，而是返回实例权重
-                contrastive_loss, instance_weights = self.model.compute_contrastive_loss(
-                    vis_repr=vis_pos,
-                    sem_repr=sem_pos,
-                    surprise_score=surprise_batch,
-                    base_temp=0.07,
-                    alpha=0.5  # 权重调节系数: weights = 1.0 + 0.5 * surprise
-                )
+                    # 调用模型的compute_contrastive_loss方法
+                    # [FIX 2] 修复: 不再使用自适应温度，而是返回实例权重
+                    contrastive_loss, instance_weights = self.model.compute_contrastive_loss(
+                        vis_repr=vis_pos,
+                        sem_repr=sem_pos,
+                        surprise_score=surprise_batch,
+                        base_temp=0.07,
+                        alpha=0.5  # 权重调节系数: weights = 1.0 + 0.5 * surprise
+                    )
 
-                # [FIX 2] 应用实例权重到对比学习损失
-                # 修复前: loss = rec_loss + λ * contrastive_loss
-                # 修复后: 困难样本(高surprise)获得更高的对比学习权重
-                if instance_weights is not None:
-                    # 重新计算每个样本的损失，应用权重后再平均
-                    # 注意: contrastive_loss已经是均值，这里需要重新获取per_sample_loss
-                    # 为了简化，我们直接对整体损失进行调整
-                    # weighted_cl_loss = contrastive_loss * instance_weights.mean()
-                    # 但更正确的做法是在compute_contrastive_loss内部返回per_sample_loss
-                    # 这里我们使用一个简化版本：用平均权重缩放
-                    avg_weight = instance_weights.mean()
-                    weighted_contrastive_loss = contrastive_loss * avg_weight
-                else:
-                    weighted_contrastive_loss = contrastive_loss
+                    # [FIX 2] 应用实例权重到对比学习损失
+                    # 修复前: loss = rec_loss + λ * contrastive_loss
+                    # 修复后: 困难样本(高surprise)获得更高的对比学习权重
+                    if instance_weights is not None:
+                        # 重新计算每个样本的损失，应用权重后再平均
+                        # 注意: contrastive_loss已经是均值，这里需要重新获取per_sample_loss
+                        # 为了简化，我们直接对整体损失进行调整
+                        # weighted_cl_loss = contrastive_loss * instance_weights.mean()
+                        # 但更正确的做法是在compute_contrastive_loss内部返回per_sample_loss
+                        # 这里我们使用一个简化版本：用平均权重缩放
+                        avg_weight = instance_weights.mean()
+                        weighted_contrastive_loss = contrastive_loss * avg_weight
+                    else:
+                        weighted_contrastive_loss = contrastive_loss
+
+                    # ===========================
+                    # 总损失（加入负载均衡损失）
+                    # ===========================
+                    loss = rec_loss + self.contrastive_lambda * weighted_contrastive_loss + 0.01 * lb_loss
 
                 # ===========================
-                # 总损失（加入负载均衡损失）
+                # [加速优化1] 反向传播 - 使用GradScaler
                 # ===========================
-                loss = rec_loss + self.contrastive_lambda * weighted_contrastive_loss + 0.01 * lb_loss
-
-                # 反向传播
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                if self.scaler is not None:
+                    # 使用scaler进行混合精度的反向传播
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # CPU模式，正常反向传播
+                    loss.backward()
+                    self.optimizer.step()
 
                 # ===========================
                 # 【Surprise-based Memory Update】
@@ -677,7 +696,7 @@ class FedMemClient:
         target_items: torch.Tensor
     ) -> torch.Tensor:
         """
-        负采样（排除正样本）
+        [加速优化3] 优化后的负采样（批量化处理，避免逐样本循环）
 
         Args:
             batch_size: 批大小
@@ -686,27 +705,33 @@ class FedMemClient:
         Returns:
             neg_items: [B, num_negatives]
         """
+        # [优化3] 一次性生成所有负样本（过采样以确保足够）
+        # 为每个样本生成2倍的候选，然后过滤
+        all_candidates = torch.randint(
+            1, self.num_items,
+            (batch_size, self.num_negatives * 2),
+            device=self.device
+        )  # [B, num_negatives*2]
+
+        # 创建正样本的mask：[B, num_negatives*2]
+        pos_mask = all_candidates == target_items.unsqueeze(1)
+
+        # 将正样本位置设置为0（无效item id）
+        all_candidates[pos_mask] = 0
+
+        # 对于每个样本，选择前num_negatives个非零候选
         neg_items = []
-
         for i in range(batch_size):
-            pos_item = target_items[i].item()
-            neg_list = []
+            valid_negs = all_candidates[i][all_candidates[i] != 0]
+            if len(valid_negs) >= self.num_negatives:
+                neg_items.append(valid_negs[:self.num_negatives])
+            else:
+                # 如果不够，补充随机采样（极少发生）
+                need_more = self.num_negatives - len(valid_negs)
+                extra = torch.randint(1, self.num_items, (need_more,), device=self.device)
+                neg_items.append(torch.cat([valid_negs, extra]))
 
-            # 采样直到获得足够的负样本（排除正样本）
-            while len(neg_list) < self.num_negatives:
-                candidates = torch.randint(
-                    1, self.num_items,
-                    (self.num_negatives * 2,),  # 多采样一些以提高效率
-                    device=self.device
-                )
-                # 过滤掉正样本
-                valid_negs = candidates[candidates != pos_item]
-                neg_list.extend(valid_negs.tolist())
-
-            # 截取所需数量
-            neg_items.append(neg_list[:self.num_negatives])
-
-        return torch.tensor(neg_items, dtype=torch.long, device=self.device)
+        return torch.stack(neg_items)  # [B, num_negatives]
 
     def evaluate(
         self,

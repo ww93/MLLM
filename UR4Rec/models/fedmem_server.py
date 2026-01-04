@@ -426,8 +426,29 @@ class FedMemServer:
             # 训练一轮
             round_metrics = self.train_round(round_idx, verbose=verbose)
 
+            # [加速优化2] 动态验证频率
+            # 前20轮：每5轮验证一次（Warmup阶段性能低，频繁验证浪费时间）
+            # 后期：每2轮验证一次（精细调优阶段）
+            should_validate = False
+            if round_idx < 20:
+                # Warmup阶段：每5轮或最后一轮验证
+                should_validate = (round_idx % 5 == 0) or (round_idx == self.num_rounds - 1)
+            else:
+                # 后期：每2轮或最后一轮验证
+                should_validate = (round_idx % 2 == 0) or (round_idx == self.num_rounds - 1)
+
             # 在验证集上评估（传递user_sequences）
-            val_metrics = self.evaluate_global_model(user_sequences=user_sequences, split="val", verbose=verbose)
+            if should_validate:
+                val_metrics = self.evaluate_global_model(user_sequences=user_sequences, split="val", verbose=verbose)
+            else:
+                # 不验证时，复用上一次的验证结果
+                if len(self.train_history['val_metrics']) > 0:
+                    val_metrics = self.train_history['val_metrics'][-1]
+                    if verbose:
+                        print(f"  ⏭️  跳过验证（将在Round {round_idx + (5 if round_idx < 20 else 2) - round_idx % (5 if round_idx < 20 else 2)}时验证）")
+                else:
+                    # 第一轮必须验证
+                    val_metrics = self.evaluate_global_model(user_sequences=user_sequences, split="val", verbose=verbose)
 
             # 记录历史
             self.train_history['round'].append(round_idx)
@@ -438,25 +459,30 @@ class FedMemServer:
                 'avg_memory_updates': round_metrics.get('avg_memory_updates', 0)
             })
 
-            # Early stopping 检查
-            current_val_metric = val_metrics['HR@10']  # 使用 HR@10 作为主要指标
-
-            if current_val_metric > self.best_val_metric:
-                self.best_val_metric = current_val_metric
-                self.best_model_state = copy.deepcopy(
-                    self.global_model.state_dict()
-                )
-                if self.global_abstract_memory is not None:
-                    self.best_global_memory = self.global_abstract_memory.clone()
-                self.rounds_without_improvement = 0
-
-                if verbose:
-                    print(f"✓ 新的最佳验证 HR@10: {self.best_val_metric:.4f}")
+            # Early stopping 检查（只在实际验证时更新）
+            if should_validate:
+                current_val_metric = val_metrics['HR@10']  # 使用 HR@10 作为主要指标
             else:
-                self.rounds_without_improvement += 1
+                current_val_metric = None
 
-                if verbose:
-                    print(f"  连续 {self.rounds_without_improvement} 轮无改进 "
+            # 只在实际验证时才更新best model和early stopping计数
+            if current_val_metric is not None:
+                if current_val_metric > self.best_val_metric:
+                    self.best_val_metric = current_val_metric
+                    self.best_model_state = copy.deepcopy(
+                        self.global_model.state_dict()
+                    )
+                    if self.global_abstract_memory is not None:
+                        self.best_global_memory = self.global_abstract_memory.clone()
+                    self.rounds_without_improvement = 0
+
+                    if verbose:
+                        print(f"✓ 新的最佳验证 HR@10: {self.best_val_metric:.4f}")
+                else:
+                    self.rounds_without_improvement += 1
+
+                    if verbose:
+                        print(f"  连续 {self.rounds_without_improvement} 轮无改进 "
                           f"(最佳: {self.best_val_metric:.4f})")
 
             # Early stopping
