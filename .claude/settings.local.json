@@ -38,7 +38,13 @@
       "Bash(do sleep 10)",
       "Bash(while [ ! -f \"UR4Rec/checkpoints/sasrec_fallback_test/train_history.json\" ])",
       "Bash(source ../venv/bin/activate)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(xargs -0 rm -rf)",
+      "Bash(test:*)",
+      "Bash(sort:*)",
+      "Bash(if [ -f \"UR4Rec/checkpoints/stage3_moe/train_history.json\" ])",
+      "Bash(then)",
+      "Bash(else)"
     ],
     "deny": [],
     "ask": []

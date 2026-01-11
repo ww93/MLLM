@@ -113,15 +113,15 @@ def main():
     parser = argparse.ArgumentParser(description="Train Federated SASRec")
 
     # 数据参数
-    parser.add_argument("--data_dir", type=str, required=True,
+    parser.add_argument("--data_dir", type=str, default="UR4Rec/data",
                         help="数据目录")
-    parser.add_argument("--data_file", type=str, required=True,
+    parser.add_argument("--data_file", type=str, default="ml1m_ratings_processed.dat",
                         help="数据文件名")
-    parser.add_argument("--save_dir", type=str, required=True,
+    parser.add_argument("--save_dir", type=str, default="UR4Rec/checkpoints/federated_sasrec",
                         help="模型保存目录")
 
     # 联邦学习参数
-    parser.add_argument("--num_rounds", type=int, default=10,
+    parser.add_argument("--num_rounds", type=int, default=30,
                         help="联邦学习轮数")
     parser.add_argument("--local_epochs", type=int, default=1,
                         help="本地训练轮数")
@@ -153,7 +153,7 @@ def main():
                         help="训练时负样本数量")
 
     # 评估参数
-    parser.add_argument("--use_negative_sampling", action="store_true",
+    parser.add_argument("--use_negative_sampling", default=True,
                         help="使用1:100负采样评估（对齐SASRec论文）")
     parser.add_argument("--num_negatives_eval", type=int, default=100,
                         help="评估时的负样本数量（默认100）")

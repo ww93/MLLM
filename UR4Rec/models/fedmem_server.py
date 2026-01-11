@@ -278,14 +278,20 @@ class FedMemServer:
         if self.partial_aggregation_warmup_rounds > 0 and round_idx < self.partial_aggregation_warmup_rounds:
             if verbose:
                 print(f"  [Warmup阶段 {round_idx+1}/{self.partial_aggregation_warmup_rounds}] 只聚合SASRec参数")
+            def _is_warmup_param(key: str) -> bool:
+                """Warmup should aggregate backbone + embeddings; exclude router/experts/fusion/gating."""
+                k = key.lower()
+                if ("router" in k) or ("expert" in k) or ("cross_modal" in k) or ("fusion" in k) or ("gating" in k):
+                    return False
+                return ("sasrec" in k) or ("item_emb" in k) or ("item_embedding" in k) or ("pos" in k) or ("position" in k)
 
             # 过滤客户端模型：只保留sasrec相关参数
             filtered_client_models = []
             for client_model in client_models:
                 filtered_model = OrderedDict()
                 for key, value in client_model.items():
-                    # 只保留包含 "sasrec" 的参数，排除 router 和 expert
-                    if "sasrec" in key and "router" not in key and "expert" not in key:
+                    # Warmup聚合Backbone(含embedding)，排除router/experts/fusion/gating
+                    if _is_warmup_param(key):
                         filtered_model[key] = value
                 filtered_client_models.append(filtered_model)
 

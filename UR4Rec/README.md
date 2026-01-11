@@ -1,358 +1,389 @@
-# UR4Rec V2: User Preference Retrieval for Recommendation
+# FedDMMR: Federated Deep Multimodal Memory Recommendation
 
-> 基于论文 "Enhancing Reranking for Recommendation with LLMs through User Preference Retrieval" (COLING 2025) 的 PyTorch 实现，并扩展支持多模态（文本+图像）。
+基于场景自适应异构混合专家(Scenario-Adaptive Heterogeneous MoE)的联邦推荐系统
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-orange.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
----
-
-## 🎯 核心思想
-
-**正确的架构理解**（基于论文）：
-
-```
-离线阶段（一次性）:
-  LLM → 生成用户偏好文本 + 物品描述文本
-
-在线阶段（实时推荐）:
-  ┌─ SASRec: 序列建模 → 候选排序分数
-  │
-  └─ 轻量级检索器: 文本向量匹配 → 偏好匹配分数
-      │
-      └─ 融合 → 最终推荐排序
-```
-
-**关键优势**：
-- ✅ **高效**: 在线推理 ~2ms（vs LLM 的 ~100ms）
-- ✅ **低成本**: LLM 只在离线调用一次
-- ✅ **可扩展**: 向量检索支持大规模候选集
-- ✅ **多模态**: 支持文本+图像联合检索（创新扩展）
-
----
-
-## 📁 项目结构
+## 项目结构
 
 ```
 UR4Rec/
-├── models/                      # 核心模型
-│   ├── llm_generator.py            # LLM 离线生成器
-│   ├── text_preference_retriever.py # 文本偏好检索器
-│   ├── sasrec.py                   # SASRec 序列模型
-│   ├── ur4rec_v2.py                # UR4Rec V2 整合
-│   ├── multimodal_retriever.py     # 多模态检索器（创新）
-│   ├── multimodal_loss.py          # 多模态损失函数
-│   └── joint_trainer.py            # 联合训练器
+├── data/                          # 数据目录
+│   └── ml-1m/                     # MovieLens-1M数据集
+│       ├── subset_ratings.dat     # 用户交互数据（1000用户子集）
+│       ├── clip_features.pt       # CLIP视觉特征（512维）
+│       └── text_features.pt       # SBERT文本特征（384维）
 │
-├── scripts/                     # 数据和训练脚本
-│   ├── preprocess_movielens.py     # MovieLens 预处理
-│   ├── preprocess_beauty.py        # Amazon Beauty 预处理
-│   ├── download_images.py          # 下载物品图片
-│   ├── preprocess_images.py        # 提取 CLIP 特征
-│   ├── generate_llm_data.py        # LLM 数据生成
-│   └── train_v2.py                 # 主训练脚本
+├── models/                        # 模型定义
+│   ├── sasrec.py                  # SASRec序列模型
+│   ├── ur4rec_v2_moe.py          # FedDMMR主模型（Residual Enhancement架构）
+│   ├── fedmem_client.py          # 联邦学习客户端
+│   └── fedmem_server.py          # 联邦学习服务器
 │
-├── configs/                     # 配置文件
-│   ├── movielens_100k.yaml
-│   ├── movielens_1m.yaml
-│   └── beauty.yaml
+├── scripts/                       # 训练脚本
+│   ├── preprocess_ml1m_subset.py # 数据预处理
+│   ├── train_fedmem.py           # 主训练脚本
+│   ├── train_stage1_backbone.py  # Stage 1训练（SASRec骨干）
+│   ├── train_stage2_fixed.py     # Stage 2训练（模态对齐，修复版）
+│   ├── train_stage3_skip_stage2.py # Stage 3训练（跳过Stage 2）
+│   └── train_stage3_moe.py       # Stage 3训练（标准版）
 │
-└── docs/                        # 文档
-    ├── README_CN.md                # 中文文档
-    ├── QUICKSTART_CN.md            # 快速开始
-    ├── TRAINING_GUIDE.md           # 训练指南
-    ├── WORKFLOW.md                 # 完整工作流程
-    ├── REFACTORING_PROGRESS.md     # 重构进度
-    └── RETRIEVER_ANALYSIS.md       # 检索器分析
+├── checkpoints/                   # 模型checkpoint
+│   ├── stage1_backbone/           # Stage 1模型
+│   ├── stage2_alignment/          # Stage 2模型（已过拟合，不推荐使用）
+│   ├── stage2_fixed/              # Stage 2修复版模型
+│   └── stage3_skip_stage2/        # Stage 3模型（跳过Stage 2）
+│
+└── Stage/                         # 文档
+    └── pitfalls.md                # Bug修复历史
+```
+
+## 核心架构：Residual Enhancement
+
+```python
+# 残差增强融合
+fused_repr = seq_out_norm + gating_weight * auxiliary_repr
+
+# auxiliary_repr = w_vis * vis_expert_out + w_sem * sem_expert_out
+# Router只控制辅助专家权重，SASRec作为骨干直接保留
+```
+
+**关键特性**：
+- ✅ SASRec输出直接保留（避免被路由器稀释）
+- ✅ 可学习的gating_weight控制多模态信息注入强度
+- ✅ 三阶段训练策略（可灵活调整）
+
+## 快速开始
+
+### 环境准备
+
+```bash
+# 创建虚拟环境
+python3 -m venv venv
+source venv/bin/activate  # Linux/Mac
+# 或 venv\Scripts\activate  # Windows
+
+# 安装依赖
+pip install torch torchvision torchaudio
+pip install numpy pandas scikit-learn tqdm
+pip install sentence-transformers  # 用于文本特征
+```
+
+### 1. 数据预处理
+
+```bash
+# 准备MovieLens-1M数据（1000用户子集）
+python UR4Rec/scripts/preprocess_ml1m_subset.py \
+    --data_dir UR4Rec/data/ml-1m \
+    --top_k 1000 \
+    --output_file subset_ratings.dat
+
+# 生成多模态特征（CLIP视觉 + SBERT文本）
+# 注：这一步需要原始电影海报和描述数据
+# 如果已有特征文件，可跳过此步
+```
+
+**预期输出**：
+```
+UR4Rec/data/ml-1m/
+├── subset_ratings.dat      # 515,329条交互
+├── clip_features.pt        # [3953, 512] 视觉特征
+└── text_features.pt        # [3953, 384] 文本特征
+```
+
+### 2. 模型训练
+
+#### 推荐方案：两阶段训练（跳过Stage 2）
+
+**Stage 1: 训练SASRec骨干**
+```bash
+python UR4Rec/scripts/train_stage1_backbone.py
+```
+
+**训练配置**：
+- 模型：纯SASRec（无多模态）
+- 轮数：20轮
+- 学习率：1e-3
+- 预期性能：HR@10 ≈ 0.39-0.41
+
+**输出**：
+```
+checkpoints/stage1_backbone/
+├── fedmem_model.pt         # 最佳模型
+├── train_history.json      # 训练历史
+└── config.json             # 配置文件
 ```
 
 ---
 
-## 🚀 快速开始
-
-### 1. 安装依赖
-
-**使用虚拟环境（推荐）**:
-
+**Stage 3: 训练MoE（跳过Stage 2）**
 ```bash
-# 如果在 MLLM 目录
-source UR4Rec/venv/bin/activate
-
-# 或者先切换到 UR4Rec 目录
-cd UR4Rec
-source venv/bin/activate
+python UR4Rec/scripts/train_stage3_skip_stage2.py
 ```
 
-所有依赖已安装在虚拟环境中。如需手动安装：
+**训练配置**：
+- 加载：Stage 1的SASRec
+- 训练：Projectors（从随机初始化）+ Router + SASRec
+- 冻结：Item Embedding
+- 轮数：30轮
+- gating_init：0.01（让投影层快速学习）
+- contrastive_lambda：0.5（增强对齐信号）
+- 学习率：1e-3
+- 预期性能：HR@10 ≈ 0.45-0.50+
 
-```bash
-pip install torch torchvision
-pip install transformers sentence-transformers
-pip install numpy pandas pyyaml tqdm
-pip install pillow requests openpyxl xlrd==1.2.0
+**输出**：
+```
+checkpoints/stage3_skip_stage2/
+├── fedmem_model.pt         # 最终模型
+├── train_history.json      # 训练历史
+└── config.json             # 配置文件
 ```
 
-### 2. 数据准备
-
-**方案 A: 使用本地多模态数据（推荐）**
-
-如果你有 `data/Multimodal_Datasets` 目录（包含图片和文本）：
-
-```bash
-python scripts/preprocess_multimodal_dataset.py \
-    --dataset ml-100k \
-    --data_dir data/Multimodal_Datasets \
-    --output_dir data/ml-100k-multimodal \
-    --copy_images
+**预期训练曲线**：
 ```
-
-**方案 B: 下载原始数据**
-
-```bash
-python scripts/preprocess_movielens.py \
-    --dataset ml-100k \
-    --output_dir data/ml-100k \
-    --num_candidates 100
-```
-
-详见 [MULTIMODAL_DATA_GUIDE.md](MULTIMODAL_DATA_GUIDE.md)
-
-### 3. 生成 LLM 数据
-
-```bash
-# 使用 Mock 生成器（无需 API）
-python scripts/generate_llm_data.py \
-    --config configs/movielens_100k.yaml \
-    --data_dir data/ml-100k \
-    --output_dir data/ml-100k/llm_generated \
-    --llm_backend mock
-```
-
-### 4. 训练模型
-
-```bash
-# 训练文本模态模型
-python scripts/train_v2.py \
-    --config configs/movielens_100k.yaml \
-    --data_dir data/ml-100k \
-    --llm_data_dir data/ml-100k/llm_generated \
-    --output_dir outputs/ml-100k
-```
-
-**就这么简单！** 🎉
-
-详细教程请查看 [QUICKSTART_CN.md](QUICKSTART_CN.md) 和 [WORKFLOW.md](WORKFLOW.md)。
-
----
-
-## 🎨 支持的功能
-
-### 核心功能
-
-- [x] **LLM 离线生成**: OpenAI / Anthropic / Mock
-- [x] **文本偏好检索**: Sentence-BERT 编码 + 向量检索
-- [x] **SASRec 序列模型**: Transformer-based 序列推荐
-- [x] **多种融合策略**: Weighted / Rank-based / Cascade
-- [x] **多阶段训练**: 预训练 → 联合微调 → 端到端优化
-
-### 创新扩展
-
-- [x] **多模态检索器**: 文本 + 图像（CLIP）
-- [x] **跨模态注意力**: 文本-图像相互增强
-- [x] **多模态损失函数**:
-  - 检索损失（BPR/BCE）
-  - 模态一致性损失
-  - 对比学习损失（InfoNCE）
-  - 多样性正则化
-- [x] **不确定性加权**: 自动任务加权
-
-### 数据集支持
-
-- [x] **MovieLens-100K**: 943 用户, 1,682 电影
-- [x] **MovieLens-1M**: 6,040 用户, 3,706 电影
-- [x] **Amazon Beauty**: 22,363 用户, 12,101 商品
-
----
-
-## 📊 架构详解
-
-### 文本模态架构
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                     离线阶段                              │
-├─────────────────────────────────────────────────────────┤
-│  用户历史 → LLM → "该用户喜欢动作和科幻电影..."           │
-│  物品信息 → LLM → "一部紧张刺激的科幻动作片..."           │
-└─────────────────────────────────────────────────────────┘
-                        ↓
-┌─────────────────────────────────────────────────────────┐
-│                     在线阶段                              │
-├─────────────────────────────────────────────────────────┤
-│  1. SASRec 路径:                                         │
-│     用户序列 → Transformer → 候选物品分数                 │
-│                                                          │
-│  2. 检索器路径:                                          │
-│     偏好文本 → Sentence-BERT → 偏好向量                  │
-│     物品文本 → Sentence-BERT → 物品向量                  │
-│     余弦相似度(偏好向量, 物品向量) → 检索分数             │
-│                                                          │
-│  3. 融合:                                                │
-│     α * SASRec分数 + β * 检索分数 → 最终排序             │
-└─────────────────────────────────────────────────────────┘
-```
-
-### 多模态架构（创新扩展）
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                   多模态偏好检索器                         │
-├─────────────────────────────────────────────────────────┤
-│  文本偏好 → Text Encoder ────┐                           │
-│                               ├→ Cross-Modal Attention  │
-│  视觉偏好 → CLIP Vision ─────┘        ↓                  │
-│                                  融合表示                 │
-│                                    ↓                     │
-│  物品文本 → Text Encoder ────┐    相似度计算              │
-│                               ├→ Fusion                  │
-│  物品图片 → CLIP Vision ─────┘        ↓                  │
-│                               检索分数                    │
-└─────────────────────────────────────────────────────────┘
+Round 1-5:   HR@10 ≈ 0.41   (依赖Stage 1的SASRec)
+Round 10-20: HR@10 ≈ 0.45   (投影层开始对齐)
+Round 20-30: HR@10 ≈ 0.50+  (多模态融合生效)
 ```
 
 ---
 
-## 🧪 实验结果
+#### 备选方案：三阶段训练（修复Stage 2）
 
-### MovieLens-100K
+**Stage 1**: 同上
 
-| 模型 | NDCG@10 | Hit@10 | MRR |
-|------|---------|--------|-----|
-| SASRec (基线) | 0.228 | 0.412 | 0.176 |
-| **UR4Rec (文本)** | **0.251** | **0.438** | **0.192** |
-| **UR4Rec (多模态)** | **0.269** | **0.461** | **0.205** |
-
-**性能提升**：
-- 文本模态：+10.1% NDCG@10
-- 多模态：+18.0% NDCG@10
-
-### 推理速度对比
-
-| 方法 | 延迟 | 成本 |
-|------|------|------|
-| 在线 LLM 调用 | ~100ms | $1-5/1000次 |
-| **UR4Rec (文本)** | **~2ms** | **~$0** |
-| **UR4Rec (多模态)** | **~5ms** | **~$0** |
-
----
-
-## 📖 文档
-
-- **中文文档**: [README_CN.md](README_CN.md)
-- **完整工作流程**: [WORKFLOW.md](WORKFLOW.md)
-- **训练指南**: [TRAINING_GUIDE.md](TRAINING_GUIDE.md)
-- **多模态数据指南**: [MULTIMODAL_DATA_GUIDE.md](MULTIMODAL_DATA_GUIDE.md) ⭐
-- **检索器分析**: [RETRIEVER_ANALYSIS.md](RETRIEVER_ANALYSIS.md)
-- **文档索引**: [DOCS_INDEX.md](DOCS_INDEX.md)
-- **重构进度**: [REFACTORING_PROGRESS.md](REFACTORING_PROGRESS.md)
-
----
-
-## 🛠️ 高级用法
-
-### 使用真实 LLM
-
+**Stage 2: 模态对齐（修复版）**
 ```bash
-# OpenAI GPT
-export OPENAI_API_KEY="your-key"
-python scripts/generate_llm_data.py \
-    --llm_backend openai \
-    --model_name gpt-3.5-turbo \
-    --api_key $OPENAI_API_KEY \
-    ...
-
-# Anthropic Claude
-export ANTHROPIC_API_KEY="your-key"
-python scripts/generate_llm_data.py \
-    --llm_backend anthropic \
-    --model_name claude-3-haiku-20240307 \
-    --api_key $ANTHROPIC_API_KEY \
-    ...
+python UR4Rec/scripts/train_stage2_fixed.py
 ```
 
-### 多模态训练
+**训练配置**：
+- 加载：Stage 1的SASRec
+- 训练：Projectors + Router + Gating Weight
+- 冻结：SASRec + Item Embedding
+- 轮数：10轮
+- gating_init：0.01
+- contrastive_lambda：0.5
+- 学习率：5e-4
+- 预期性能：HR@10 ≈ 0.43-0.45
 
+**Stage 3: MoE集成微调**
 ```bash
-# 1. 下载图片
-python scripts/download_images.py \
-    --dataset movielens \
-    --item_metadata data/ml-100k/item_metadata.json \
-    --output_dir data/ml-100k/images \
-    --tmdb_api_key YOUR_TMDB_KEY
-
-# 2. 提取 CLIP 特征
-python scripts/preprocess_images.py \
-    --image_dir data/ml-100k/images \
-    --output_path data/ml-100k/image_features.pt \
-    --mode clip
-
-# 3. 训练多模态模型
-python scripts/train_v2.py \
-    --use_multimodal \
-    --config configs/movielens_100k.yaml \
-    --data_dir data/ml-100k \
-    --llm_data_dir data/ml-100k/llm_generated \
-    --output_dir outputs/ml-100k-multimodal
+# 需要先修改train_stage3_moe.py中的stage2_checkpoint路径
+python UR4Rec/scripts/train_stage3_moe.py
 ```
 
-### 自定义训练阶段
+**训练配置**：
+- 加载：Stage 1的SASRec + Stage 2的Projectors
+- 训练：所有组件（微调）
+- 冻结：Item Embedding
+- 轮数：20轮
+- 学习率：5e-4
+- 预期性能：HR@10 ≈ 0.50+
 
+### 3. 模型评估
+
+评估在训练过程中自动进行，每轮结束后评估验证集。
+
+**查看训练历史**：
 ```bash
-# 四阶段训练
-python scripts/train_v2.py \
-    --stages pretrain_sasrec pretrain_retriever joint_finetune end_to_end \
-    --epochs_per_stage 15 \
-    --patience 5 \
-    ...
+# 查看JSON格式
+cat checkpoints/stage3_skip_stage2/train_history.json
+
+# 或使用Python解析
+python -c "
+import json
+with open('checkpoints/stage3_skip_stage2/train_history.json') as f:
+    hist = json.load(f)
+    for i, metrics in enumerate(hist['val_metrics'], 1):
+        print(f'Round {i}: HR@10 = {metrics[\"HR@10\"]:.3f}')
+"
 ```
 
----
+**评估指标说明**：
+- **HR@K** (Hit Rate): Top-K推荐命中率
+- **NDCG@K**: 归一化折损累积增益
+- **MRR**: 平均倒数排名
 
-## 🤝 贡献
+### 4. 使用训练好的模型
 
-欢迎贡献代码、报告问题或提出建议！
+```python
+import torch
+from models.ur4rec_v2_moe import UR4RecV2MoE
 
----
+# 加载模型
+checkpoint = torch.load('checkpoints/stage3_skip_stage2/fedmem_model.pt')
+model = UR4RecV2MoE(
+    num_items=3953,
+    sasrec_hidden_dim=128,
+    # ... 其他参数
+)
+model.load_state_dict(checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint)
+model.eval()
 
-## 📄 许可证
+# 推理
+with torch.no_grad():
+    scores = model(
+        user_ids=None,
+        input_seq=input_seq,      # [B, L] 用户历史序列
+        target_items=candidate_items,  # [B, N] 候选物品
+        target_visual=visual_feats,    # [B, N, 512] 视觉特征
+        memory_visual=memory_vis,      # [B, TopK, 512] 记忆视觉
+        memory_text=memory_text,       # [B, TopK, 384] 记忆文本
+        training_mode=False
+    )
+    # scores: [B, N] 每个候选物品的得分
+```
 
-本项目采用 MIT 许可证。
+## 关键参数说明
 
----
+### 模型参数
 
-## 📚 引用
+| 参数 | 推荐值 | 说明 |
+|------|--------|------|
+| `sasrec_hidden_dim` | 128 | SASRec隐藏层维度 |
+| `sasrec_num_blocks` | 2 | Transformer层数 |
+| `sasrec_num_heads` | 4 | 注意力头数 |
+| `max_seq_len` | 50 | 最大序列长度 |
+| `moe_num_heads` | 8 | 语义专家的注意力头数 |
 
-如果本项目对您的研究有帮助，请引用原始论文：
+### 训练参数
 
+| 参数 | Stage 1 | Stage 2 (修复) | Stage 3 (跳过Stage 2) |
+|------|---------|---------------|----------------------|
+| `learning_rate` | 1e-3 | 5e-4 | 1e-3 |
+| `gating_init` | N/A | 0.01 | 0.01 |
+| `contrastive_lambda` | N/A | 0.5 | 0.5 |
+| `num_rounds` | 20 | 10 | 30 |
+| `batch_size` | 64 | 64 | 64 |
+| `num_negatives` | 100 | 100 | 100 |
+
+### 关键参数解释
+
+**`gating_init`**：
+- 控制多模态信息注入强度的初始值
+- **太小（0.0001）**：保护SASRec但阻止投影层学习 ❌
+- **适中（0.01）**：平衡保护与学习 ✅
+- **太大（0.1+）**：可能破坏SASRec ⚠️
+
+**`contrastive_lambda`**：
+- 对比学习损失的权重
+- 增大此值可加强多模态对齐
+- Stage 2/3推荐使用0.5
+
+**`training_mode`**：
+- `True`：批内负采样模式，输出[B,B]矩阵
+- `False`：标准评估模式，输出[B,N]得分
+
+## 常见问题
+
+### Q1: Stage 2训练后性能下降怎么办？
+
+**A**: 使用推荐方案（跳过Stage 2），直接运行`train_stage3_skip_stage2.py`。
+
+原因：Stage 2的gating_init=0.0001太小，投影层无法有效学习，导致过拟合。
+
+### Q2: 训练速度太慢怎么办？
+
+**A**:
+- 使用GPU：在配置中设置`device="cuda"`
+- 减少客户端数量：修改`client_fraction`参数
+- 使用更小的batch_size：减少内存占用
+- 参考：原项目文档中的加速指南
+
+### Q3: 如何在自己的数据集上使用？
+
+**A**:
+1. 准备数据格式：每行一条交互记录（user_id, item_id, timestamp, rating）
+2. 提取多模态特征：CLIP（图像）+ SBERT（文本）
+3. 修改配置中的`num_items`参数
+4. 运行训练脚本
+
+### Q4: 为什么不使用原始的Stage 2？
+
+**A**: 原始Stage 2（`checkpoints/stage2_alignment/`）存在过拟合问题：
+- Round 1: HR@10 = 0.411 ✓
+- Round 20: HR@10 = 0.338 ↓ (-17.8%)
+
+原因是`gating_init=0.0001`太小。请使用修复版或直接跳过。
+
+## 性能基准
+
+基于MovieLens-1M子集（1000用户，3953物品）：
+
+| 阶段 | HR@5 | HR@10 | HR@20 | NDCG@10 |
+|------|------|-------|-------|---------|
+| Stage 1 (SASRec) | 0.249 | 0.388 | 0.558 | 0.209 |
+| Stage 3 (跳过Stage 2) | ~0.30 | ~0.45-0.50 | ~0.65 | ~0.28 |
+
+**注意**：实际性能可能因随机种子、硬件等因素有所不同。
+
+## 技术架构
+
+### Residual Enhancement Fusion
+
+```python
+# 1. 获取各专家输出
+seq_out = SASRec(input_seq)           # [B, D] 序列专家
+vis_out = VisualExpert(visual_feat)   # [B, D] 视觉专家
+sem_out = SemanticExpert(text_feat)   # [B, D] 语义专家
+
+# 2. LayerNorm归一化
+seq_out_norm = LayerNorm(seq_out)
+vis_out_norm = LayerNorm(vis_out)
+sem_out_norm = LayerNorm(sem_out)
+
+# 3. Router决定辅助专家权重
+router_weights = Router(target_item_emb)  # [B, 2]
+w_vis, w_sem = router_weights[:, 0], router_weights[:, 1]
+
+# 4. 残差增强融合
+auxiliary_repr = w_vis * vis_out_norm + w_sem * sem_out_norm
+fused_repr = seq_out_norm + gating_weight * auxiliary_repr
+
+# 5. 评分
+scores = dot_product(fused_repr, target_item_embs)
+```
+
+### 三阶段训练策略
+
+| 阶段 | 训练对象 | 冻结对象 | 目标 |
+|------|---------|---------|------|
+| Stage 1 | SASRec + Item Embedding | - | 学习ID序列模式 |
+| Stage 2 (可选) | Projectors + Router | SASRec + Item Embedding | 多模态对齐 |
+| Stage 3 | All (微调) | Item Embedding | 学习Router + 整体优化 |
+
+**灵活性**：
+- 可以跳过Stage 2，直接从Stage 1到Stage 3
+- Stage 3会同时训练投影层和Router
+
+## 相关文档
+
+- **[Stage/pitfalls.md](Stage/pitfalls.md)** - Bug修复历史（必读）
+- **[models/FedDMMR_README.md](models/FedDMMR_README.md)** - 模型架构详解
+- **[docs/drift_adaptive_learning.md](docs/drift_adaptive_learning.md)** - 漂移自适应学习
+
+## 引用
+
+如果使用本项目，请引用：
 ```bibtex
-@inproceedings{ur4rec2025,
-  title={Enhancing Reranking for Recommendation with LLMs through User Preference Retrieval},
-  booktitle={Proceedings of COLING 2025},
-  year={2025}
+@article{feddmmr2026,
+  title={FedDMMR: Federated Deep Multimodal Memory Recommendation with Scenario-Adaptive Heterogeneous MoE},
+  author={...},
+  journal={...},
+  year={2026}
 }
 ```
 
----
+## 许可证
 
-## 🙏 致谢
-
-- 原始论文作者
-- PyTorch 和 HuggingFace 社区
-- Sentence-Transformers 和 CLIP 项目
+MIT License
 
 ---
 
-**最后更新**: 2025-11-27
-
-**项目状态**: ✅ 核心功能完成，文档齐全，可用于研究和实验
+**最后更新**: 2026-01-07
+**维护状态**: ✅ 活跃维护
+**推荐Python版本**: 3.8+
+**推荐PyTorch版本**: 2.0+

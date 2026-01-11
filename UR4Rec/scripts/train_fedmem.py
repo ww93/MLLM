@@ -13,16 +13,25 @@ FedMem训练脚本：带本地动态记忆和原型聚合的联邦推荐系统�
         --save_dir checkpoints/fedmem
 
 核心特性：
-1. 本地动态记忆（LocalDynamicMemory）
-2. Surprise-based记忆更新
-3. 记忆原型聚合（Prototype Aggregation）
+1. **Two-tier本地动态记忆** (ST: 最近兴趣 + LT: 稳定多样性)
+2. **Novelty-based LT写入** (数据驱动阈值，~10%写入率)
+3. 记忆原型聚合（Prototype Aggregation，从LT提取）
 4. 对比学习损失（Contrastive Loss）
-5. **[NEW] 多模态特征加载（视觉 + 文本）**
+5. 多模态特征加载（视觉 + 文本）
+6. **[NEW] 轻量级Stage 2对齐** (投影层 <200K params)
 """
 import os
 import sys
 import json
 import argparse
+
+# Debug print switch (set FEDMEM_DEBUG=1 to enable)
+DEBUG = bool(int(os.environ.get('FEDMEM_DEBUG', '0')))
+
+def dprint(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
 import torch
 import numpy as np
 import random
@@ -33,8 +42,24 @@ from typing import Dict, List, Tuple, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.ur4rec_v2_moe import UR4RecV2MoE
+from models.fedmem_simple import FedMemSimple  # [NEW] 简化架构
 from models.fedmem_client import FedMemClient
 from models.fedmem_server import FedMemServer
+
+
+
+def str2bool(v):
+    """Robust bool parser for argparse."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got: {v}")
 
 
 def set_seed(seed: int = 42):
@@ -92,7 +117,7 @@ def load_multimodal_features(
                     visual_np = np.load(visual_path)
                     item_visual_feats = torch.from_numpy(visual_np).float().to(device)
                 elif visual_path.endswith('.pt') or visual_path.endswith('.pth'):
-                    item_visual_feats = torch.load(visual_path, map_location=device)
+                    item_visual_feats = torch.load(visual_path, map_location=device, weights_only=False)
                 else:
                     raise ValueError(f"不支持的视觉特征文件格式: {visual_path}")
 
@@ -117,17 +142,17 @@ def load_multimodal_features(
 
             except Exception as e:
                 print(f"✗ 加载视觉特征失败: {e}")
-                print(f"  将使用随机初始化的视觉特征（仅用于调试）")
+                dprint(f"  将使用随机初始化的视觉特征（仅用于调试）")
                 item_visual_feats = None
         else:
             print(f"⚠️ 警告: 视觉特征文件不存在: {visual_path}")
-            print(f"  将使用随机初始化的视觉特征（仅用于调试）")
+            dprint(f"  将使用随机初始化的视觉特征（仅用于调试）")
 
     # 如果没有加载成功，使用随机特征
     if visual_file and item_visual_feats is None:
         print(f"\n[DEBUG] 创建随机视觉特征: [{num_items}, {img_dim}]")
         item_visual_feats = torch.randn(num_items, img_dim, device=device) * 0.01
-        print(f"⚠️ 警告: 使用随机视觉特征！这仅用于调试，不适合正式训练！")
+        dprint(f"⚠️ 警告: 使用随机视觉特征！这仅用于调试，不适合正式训练！")
 
     # ========== 加载文本特征 ==========
     if text_file:
@@ -140,7 +165,7 @@ def load_multimodal_features(
                     text_np = np.load(text_path)
                     item_text_feats = torch.from_numpy(text_np).float().to(device)
                 elif text_path.endswith('.pt') or text_path.endswith('.pth'):
-                    item_text_feats = torch.load(text_path, map_location=device)
+                    item_text_feats = torch.load(text_path, map_location=device, weights_only=False)
                 else:
                     raise ValueError(f"不支持的文本特征文件格式: {text_path}")
 
@@ -165,17 +190,17 @@ def load_multimodal_features(
 
             except Exception as e:
                 print(f"✗ 加载文本特征失败: {e}")
-                print(f"  将使用随机初始化的文本特征（仅用于调试）")
+                dprint(f"  将使用随机初始化的文本特征（仅用于调试）")
                 item_text_feats = None
         else:
             print(f"\n⚠️ 警告: 文本特征文件不存在: {text_path}")
-            print(f"  将使用随机初始化的文本特征（仅用于调试）")
+            dprint(f"  将使用随机初始化的文本特征（仅用于调试）")
 
     # 如果没有加载成功，使用随机特征
     if text_file and item_text_feats is None:
         print(f"\n[DEBUG] 创建随机文本特征: [{num_items}, {text_dim}]")
         item_text_feats = torch.randn(num_items, text_dim, device=device) * 0.01
-        print(f"⚠️ 警告: 使用随机文本特征！这仅用于调试，不适合正式训练！")
+        dprint(f"⚠️ 警告: 使用随机文本特征！这仅用于调试，不适合正式训练！")
 
     # ========== 总结 ==========
     print(f"\n{'='*60}")
@@ -389,8 +414,9 @@ def create_fedmem_clients(
     print(f"  每个客户端:")
     print(f"    - 视觉特征: {'启用' if item_visual_feats is not None else '禁用'}")
     print(f"    - 文本特征: {'启用' if item_text_feats is not None else '禁用'}")
-    print(f"    - 记忆容量: {args.memory_capacity}")
-    print(f"    - Surprise阈值: {args.surprise_threshold}")
+    print(f"    - 记忆架构: Two-tier (ST: 50, LT: {args.memory_capacity})")
+    print(f"    - LT写入策略: Novelty-based (threshold=0.583)")
+    print(f"    - 兼容参数 surprise_threshold: {args.surprise_threshold}")
     print(f"{'='*60}\n")
 
     return clients
@@ -412,6 +438,23 @@ def main():
                         help="文本特征文件名 (e.g., 'item_llm_texts.npy' or 'item_llm_texts.pt')")
 
     # 模型参数
+    parser.add_argument("--model_type", type=str, default="moe",
+                        choices=["moe", "simple"],
+                        help="模型架构类型: 'moe' (MoE架构) 或 'simple' (简化架构)")
+
+    # [NEW] 三阶段训练参数
+    parser.add_argument("--stage", type=str, default="full",
+                        choices=["pretrain_sasrec", "align_projectors", "finetune_moe", "full"],
+                        help="训练阶段:\n"
+                             "  pretrain_sasrec: 第一阶段，纯ID SASRec预训练\n"
+                             "  align_projectors: 第二阶段，多模态投影层对齐\n"
+                             "  finetune_moe: 第三阶段，MoE集成微调\n"
+                             "  full: 完整训练（默认）")
+    parser.add_argument("--stage1_checkpoint", type=str, default=None,
+                        help="第一阶段checkpoint路径（用于stage2和stage3）")
+    parser.add_argument("--stage2_checkpoint", type=str, default=None,
+                        help="第二阶段checkpoint路径（用于stage3）")
+
     parser.add_argument("--num_items", type=int, default=1682,
                         help="物品总数（自动检测如果未指定）")
     parser.add_argument("--sasrec_hidden_dim", type=int, default=256,
@@ -427,15 +470,23 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=50,
                         help="最大序列长度")
 
-    # FedMem参数
-    parser.add_argument("--memory_capacity", type=int, default=50,
-                        help="本地记忆容量")
-    parser.add_argument("--surprise_threshold", type=float, default=0.3,
-                        help="Surprise阈值")
-    parser.add_argument("--contrastive_lambda", type=float, default=0.2,
+    # [NEW] 简化架构专用参数
+    parser.add_argument("--id_emb_dim", type=int, default=128,
+                        help="[简化架构] ID嵌入维度")
+    parser.add_argument("--visual_proj_dim", type=int, default=64,
+                        help="[简化架构] 视觉特征投影维度")
+    parser.add_argument("--text_proj_dim", type=int, default=64,
+                        help="[简化架构] 文本特征投影维度")
+
+    # FedMem参数 (Two-tier Memory: ST + LT)
+    parser.add_argument("--memory_capacity", type=int, default=200,
+                        help="LT (long-term) 记忆容量，推荐200 (ML-1M), ST固定50")
+    parser.add_argument("--surprise_threshold", type=float, default=0.5,
+                        help="兼容参数，新版本主要使用novelty-based写入 (默认0.583)")
+    parser.add_argument("--contrastive_lambda", type=float, default=0.05,
                         help="对比学习损失权重")
     parser.add_argument("--num_memory_prototypes", type=int, default=5,
-                        help="记忆原型数量")
+                        help="记忆原型数量（从LT提取）")
     parser.add_argument("--enable_prototype_aggregation", action="store_true",
                         help="启用原型聚合")
 
@@ -453,17 +504,17 @@ def main():
                         help="早停patience")
 
     # 训练参数
-    parser.add_argument("--learning_rate", type=float, default=5e-3,
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
                         help="学习率")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                         help="权重衰减")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="批大小")
-    parser.add_argument("--num_negatives", type=int, default=100,
+    parser.add_argument("--num_negatives", type=int, default=4,
                         help="负样本数量")
 
     # 负采样评估参数
-    parser.add_argument("--use_negative_sampling", default=True,
+    parser.add_argument("--use_negative_sampling", type=str2bool, default=True,
                         help="使用1:100负采样评估（对齐NCF/SASRec论文）")
     parser.add_argument("--num_negatives_eval", type=int, default=100,
                         help="评估时的负样本数量（默认100）")
@@ -526,59 +577,112 @@ def main():
         print("请确保数据文件存在或使用正确的路径")
         return
 
+    # [三阶段训练] 第一阶段：纯ID训练，禁用多模态
+    if args.stage == "pretrain_sasrec":
+        print(f"  [Stage 1] 纯ID SASRec预训练 - 禁用多模态特征加载")
+        visual_file_to_load = None
+        text_file_to_load = None
+
+        # [Stage 1关键修复] Stage 1目标是复现FedSASRec性能；partial warmup若只聚合'sasrec'会遗漏item/pos embedding，导致global模型无法对齐。
+        if args.partial_aggregation_warmup_rounds != 0:
+            print(f"  [Stage 1] 自动关闭partial warmup: {args.partial_aggregation_warmup_rounds} -> 0")
+            args.partial_aggregation_warmup_rounds = 0
+    else:
+        visual_file_to_load = args.visual_file
+        text_file_to_load = args.text_file
+
     # [NEW] 加载交互序列 + 多模态特征
     user_sequences, num_items, item_visual_feats, item_text_feats, img_dim, text_dim = load_user_sequences(
         data_path=data_path,
         data_dir=args.data_dir,
-        visual_file=args.visual_file,
-        text_file=args.text_file,
+        visual_file=visual_file_to_load,
+        text_file=text_file_to_load,
         device=args.device
     )
     args.num_items = num_items  # 更新num_items
 
     # ============================================
-    # 2. [UPDATED] 创建全局模型（使用实际的特征维度）
+    # 2. [UPDATED] 创建全局模型（根据model_type选择架构）
     # ============================================
-    print("\n[2/4] 创建全局 UR4RecV2MoE 模型...")
-
     # [NEW] 使用从数据加载得到的实际维度
     # 如果没有加载多模态特征，使用默认维度
     actual_text_dim = text_dim if item_text_feats is not None else 384
     actual_img_dim = img_dim if item_visual_feats is not None else 512
 
-    print(f"  模型配置:")
-    print(f"    - 物品数: {args.num_items}")
-    print(f"    - 文本特征维度: {actual_text_dim}")
-    print(f"    - 图像特征维度: {actual_img_dim}")
-    print(f"    - SASRec隐藏维度: {args.sasrec_hidden_dim}")
-    print(f"    - MoE隐藏维度: {args.sasrec_hidden_dim}")
+    # 根据model_type选择模型架构
+    if args.model_type == "moe":
+        print("\n[2/4] 创建全局 UR4RecV2MoE 模型（MoE架构）...")
+        print(f"  模型配置:")
+        print(f"    - 架构: MoE (Mixture of Experts)")
+        print(f"    - 物品数: {args.num_items}")
+        print(f"    - 文本特征维度: {actual_text_dim}")
+        print(f"    - 图像特征维度: {actual_img_dim}")
+        print(f"    - SASRec隐藏维度: {args.sasrec_hidden_dim}")
+        print(f"    - MoE隐藏维度: {args.sasrec_hidden_dim}")
 
-    global_model = UR4RecV2MoE(
-        num_items=args.num_items,
-        # SASRec参数
-        sasrec_hidden_dim=args.sasrec_hidden_dim,
-        sasrec_num_blocks=args.sasrec_num_blocks,
-        sasrec_num_heads=args.sasrec_num_heads,
-        sasrec_dropout=0.1,
-        max_seq_len=args.max_seq_len,
-        # 多模态特征维度
-        visual_dim=actual_img_dim,  # CLIP特征维度
-        text_dim=actual_text_dim,   # Sentence-BERT特征维度
-        # MoE参数
-        moe_hidden_dim=args.sasrec_hidden_dim,  # 与SASRec保持一致
-        moe_num_heads=args.moe_num_heads,
-        moe_dropout=0.1,
-        router_hidden_dim=128,
-        # 残差增强参数
-        gating_init=args.gating_init,
-        # 负载均衡
-        load_balance_lambda=0.01,
-        # 【策略1】Router Bias Initialization [已废弃，保留向后兼容]
-        init_bias_for_sasrec=args.init_bias_for_sasrec,
-        sasrec_bias_value=args.sasrec_bias_value,
-        # 设备
-        device=args.device
-    )
+        global_model = UR4RecV2MoE(
+            num_items=args.num_items,
+            # SASRec参数
+            sasrec_hidden_dim=args.sasrec_hidden_dim,
+            sasrec_num_blocks=args.sasrec_num_blocks,
+            sasrec_num_heads=args.sasrec_num_heads,
+            sasrec_dropout=0.1,
+            max_seq_len=args.max_seq_len,
+            # 多模态特征维度
+            visual_dim=actual_img_dim,  # CLIP特征维度
+            text_dim=actual_text_dim,   # Sentence-BERT特征维度
+            # MoE参数
+            moe_hidden_dim=args.sasrec_hidden_dim,  # 与SASRec保持一致
+            moe_num_heads=args.moe_num_heads,
+            moe_dropout=0.1,
+            router_hidden_dim=128,
+            # 残差增强参数
+            gating_init=args.gating_init,
+            # 负载均衡
+            load_balance_lambda=0.01,
+            # 【策略1】Router Bias Initialization [已废弃，保留向后兼容]
+            init_bias_for_sasrec=args.init_bias_for_sasrec,
+            sasrec_bias_value=args.sasrec_bias_value,
+            # 设备
+            device=args.device
+        )
+
+    elif args.model_type == "simple":
+        print("\n[2/4] 创建全局 FedMemSimple 模型（简化架构）...")
+
+        # 计算总的输入维度
+        total_input_dim = args.id_emb_dim + args.visual_proj_dim + args.text_proj_dim
+
+        print(f"  模型配置:")
+        print(f"    - 架构: Simple (直接拼接)")
+        print(f"    - 物品数: {args.num_items}")
+        print(f"    - ID嵌入维度: {args.id_emb_dim}")
+        print(f"    - 视觉投影维度: {actual_img_dim} → {args.visual_proj_dim}")
+        print(f"    - 文本投影维度: {actual_text_dim} → {args.text_proj_dim}")
+        print(f"    - 拼接后总维度: {total_input_dim}")
+        print(f"    - SASRec输入维度: {total_input_dim}")
+
+        global_model = FedMemSimple(
+            num_items=args.num_items,
+            # ID embedding维度
+            id_emb_dim=args.id_emb_dim,
+            # 多模态特征维度
+            visual_dim=actual_img_dim,      # CLIP特征
+            text_dim=actual_text_dim,       # Sentence-BERT特征
+            # 投影维度
+            visual_proj_dim=args.visual_proj_dim,
+            text_proj_dim=args.text_proj_dim,
+            # SASRec参数
+            sasrec_num_blocks=args.sasrec_num_blocks,
+            sasrec_num_heads=args.sasrec_num_heads,
+            sasrec_dropout=0.1,
+            max_seq_len=args.max_seq_len,
+            # 设备
+            device=args.device
+        )
+
+    else:
+        raise ValueError(f"未知的model_type: {args.model_type}. 支持: 'moe', 'simple'")
 
     print(f"\n✓ 模型创建成功!")
     print(f"  总参数数量: {sum(p.numel() for p in global_model.parameters()):,}")
@@ -642,9 +746,197 @@ def main():
             print(f"  将使用随机初始化继续训练")
 
     # ============================================
-    # 3. [UPDATED] 创建FedMem客户端（传入多模态特征）
+    # 3. [三阶段训练] Checkpoint加载与模型更新 (在创建客户端之前)
     # ============================================
-    print("\n[3/4] 创建 FedMem 客户端...")
+    print(f"\n[3/4] 三阶段训练策略 - Checkpoint加载...")
+
+    if args.stage == "pretrain_sasrec":
+        # ===== 第一阶段：纯ID SASRec预训练 =====
+        print(f"  [Stage 1: Backbone Pre-training]")
+        print(f"  目标: 训练高质量的纯ID SASRec (预期 HR@10 ≈ 0.60-0.70)")
+        print(f"  训练对象: SASRec (Embedding + Transformer)")
+        print(f"  数据: 仅Item ID序列")
+        print(f"  冻结: 无")
+        print(f"  ✓ 所有参数可训练")
+
+    elif args.stage == "align_projectors":
+        # ===== 第二阶段：多模态投影层对齐 =====
+        print(f"  [Stage 2: Modality Alignment]")
+        print(f"  目标: 让多模态特征对齐到ID空间")
+        print(f"  训练对象: Visual/Semantic Projectors")
+        print(f"  冻结: SASRec + Item Embedding")
+
+        # [关键修复] Stage 2禁用warmup
+        # 原因：warmup只聚合SASRec，但Stage 2冻结了SASRec，训练的是投影层
+        if args.partial_aggregation_warmup_rounds > 0:
+            print(f"  ⚠️  警告: Stage 2应该禁用warmup（当前设置={args.partial_aggregation_warmup_rounds}）")
+            print(f"  原因: warmup只聚合SASRec，但Stage 2训练的是投影层")
+            print(f"  自动禁用warmup...")
+            args.partial_aggregation_warmup_rounds = 0
+
+        # 加载Stage 1 checkpoint
+        if args.stage1_checkpoint and os.path.exists(args.stage1_checkpoint):
+            print(f"  加载Stage 1 checkpoint: {args.stage1_checkpoint}")
+            try:
+                checkpoint = torch.load(args.stage1_checkpoint, map_location=args.device, weights_only=False)
+                state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+
+                # [方案2修复] Stage 2时不加载expert和LayerNorm参数，因为维度已改变
+                # Stage 1的expert是128维，方案2的expert是512/384维
+                # Stage 1的LayerNorm也是128维，需要跳过避免覆盖新的512/384维LayerNorm
+                filtered_state_dict = {}
+                skipped_keys = []
+                for key, value in state_dict.items():
+                    # 跳过visual_expert、semantic_expert、cross_modal_fusion和相关LayerNorm的参数
+                    if any(pattern in key for pattern in [
+                        'visual_expert', 'semantic_expert', 'cross_modal_fusion',
+                        'vis_layernorm', 'sem_layernorm'
+                    ]):
+                        skipped_keys.append(key)
+                        continue
+                    filtered_state_dict[key] = value
+
+                if skipped_keys:
+                    dprint(f"  [方案2] 跳过加载expert和LayerNorm参数（维度已改变）: {len(skipped_keys)}个")
+                    for key in skipped_keys[:3]:
+                        print(f"     - {key}")
+                    if len(skipped_keys) > 3:
+                        print(f"     - ... 还有{len(skipped_keys)-3}个")
+
+                # [STAGE 2/3 FIX] strict=False允许部分加载，忽略missing keys（如gating_weight）
+                missing_keys, unexpected_keys = global_model.load_state_dict(filtered_state_dict, strict=False)
+
+                print(f"  ✓ 成功加载Stage 1权重到global_model")
+                if missing_keys:
+                    dprint(f"  ℹ️  新增参数（Stage 1 checkpoint中不存在）: {len(missing_keys)}个")
+                    for key in missing_keys[:3]:  # 只显示前3个
+                        print(f"     - {key} (将使用随机初始化)")
+                    if len(missing_keys) > 3:
+                        print(f"     - ... 还有{len(missing_keys)-3}个")
+
+                # [调试] 验证权重确实被加载 - 检查关键参数
+                param_stats = []
+                for name, param in global_model.named_parameters():
+                    if 'item_emb' in name.lower() or 'sasrec' in name.lower():
+                        param_stats.append((name, param.mean().item(), param.std().item(), param.abs().max().item()))
+                        if len(param_stats) >= 3:  # 只打印前3个关键参数
+                            break
+
+                dprint(f"  [调试] 关键参数统计（验证是否真的加载了训练好的权重）:")
+                for name, mean, std, max_val in param_stats:
+                    print(f"    {name}: mean={mean:.4f}, std={std:.4f}, max={max_val:.4f}")
+                dprint(f"  [调试] 如果是训练好的权重，mean和max应该有明显的非零值")
+
+                # [方案2调试] 验证expert和LayerNorm的维度
+                dprint(f"\n  [方案2调试] 验证模型维度设置:")
+                print(f"    preserve_multimodal_dim: {global_model.preserve_multimodal_dim}")
+                print(f"    visual_expert.output_dim: {global_model.visual_expert.output_dim}")
+                print(f"    semantic_expert.output_dim: {global_model.semantic_expert.output_dim}")
+                print(f"    vis_layernorm.normalized_shape: {global_model.vis_layernorm.normalized_shape}")
+                print(f"    sem_layernorm.normalized_shape: {global_model.sem_layernorm.normalized_shape}")
+
+            except Exception as e:
+                print(f"  ✗ 加载失败: {e}")
+        else:
+            print(f"  ⚠️  警告: 未提供Stage 1 checkpoint，使用随机初始化")
+
+        print(f"  ✓ Checkpoint加载完成，冻结策略将在创建客户端后应用")
+
+    elif args.stage == "finetune_moe":
+        # ===== 第三阶段：MoE集成微调 =====
+        print(f"  [Stage 3: MoE Fine-tuning]")
+        print(f"  目标: 学习Router (什么时候用谁)")
+        print(f"  微调 (小LR): SASRec Transformer, Visual/Semantic Projectors")
+        print(f"  全速训练: MoE Router")
+        print(f"  冻结: Item Embedding (锚点)")
+
+        # [关键修复] Stage 3禁用warmup
+        # 原因：warmup只聚合SASRec，但Stage 3需要聚合Transformer、投影层、Router
+        if args.partial_aggregation_warmup_rounds > 0:
+            print(f"  ⚠️  警告: Stage 3应该禁用warmup（当前设置={args.partial_aggregation_warmup_rounds}）")
+            print(f"  原因: warmup只聚合SASRec，但Stage 3需要聚合多个组件")
+            print(f"  自动禁用warmup...")
+            args.partial_aggregation_warmup_rounds = 0
+
+        # 加载Stage 1 checkpoint (backbone)
+        if args.stage1_checkpoint and os.path.exists(args.stage1_checkpoint):
+            print(f"  加载Stage 1 checkpoint: {args.stage1_checkpoint}")
+            try:
+                checkpoint = torch.load(args.stage1_checkpoint, map_location=args.device, weights_only=False)
+                if 'model_state_dict' in checkpoint:
+                    state_dict = checkpoint['model_state_dict']
+                else:
+                    state_dict = checkpoint
+
+                # [关键修复] 加载SASRec + Item Embedding
+                # 原因：Stage 3冻结item_emb，必须加载训练好的embedding
+                # 否则会出现"训练好的SASRec + 随机的embedding"的不匹配
+                current_state = global_model.state_dict()
+                loaded = 0
+                for key, value in state_dict.items():
+                    # 加载 SASRec 和 item_emb
+                    if ('sasrec' in key.lower() or 'item_emb' in key.lower()) and key in current_state:
+                        current_state[key] = value
+                        loaded += 1
+                global_model.load_state_dict(current_state)
+                print(f"  ✓ 成功加载Stage 1权重到global_model ({loaded}个参数)")
+                print(f"     包括: SASRec骨干 + Item Embedding")
+            except Exception as e:
+                print(f"  ✗ 加载Stage 1失败: {e}")
+
+        # 加载Stage 2 checkpoint (projectors)
+        if args.stage2_checkpoint and os.path.exists(args.stage2_checkpoint):
+            print(f"  加载Stage 2 checkpoint: {args.stage2_checkpoint}")
+            try:
+                checkpoint = torch.load(args.stage2_checkpoint, map_location=args.device, weights_only=False)
+                if 'model_state_dict' in checkpoint:
+                    state_dict = checkpoint['model_state_dict']
+                else:
+                    state_dict = checkpoint
+
+                # [方案2修复] 加载投影层参数，带形状检查
+                # 原因：旧的Stage 2 checkpoint可能有128-dim experts，但方案2需要512/384-dim
+                current_state = global_model.state_dict()
+                loaded = 0
+                skipped_shape = []
+                for key, value in state_dict.items():
+                    if ('proj' in key.lower() or 'expert' in key.lower() or 'cross_modal_fusion' in key.lower()) and key in current_state:
+                        # 形状检查：只加载形状匹配的参数
+                        if current_state[key].shape == value.shape:
+                            current_state[key] = value
+                            loaded += 1
+                        else:
+                            skipped_shape.append(f"{key} (ckpt:{value.shape} vs model:{current_state[key].shape})")
+
+                if skipped_shape:
+                    print(f"  ℹ️  跳过形状不匹配的参数 ({len(skipped_shape)}个):")
+                    for item in skipped_shape[:5]:  # 只显示前5个
+                        print(f"     - {item}")
+                    if len(skipped_shape) > 5:
+                        print(f"     - ... 还有{len(skipped_shape)-5}个")
+                    print(f"  提示: 如果是从旧版Stage 2 checkpoint加载，这是正常的（维度已改变）")
+
+                global_model.load_state_dict(current_state)
+                print(f"  ✓ 成功加载Stage 2权重到global_model ({loaded}个参数)")
+            except Exception as e:
+                print(f"  ✗ 加载Stage 2失败: {e}")
+
+        print(f"  ✓ Checkpoint加载完成，冻结策略将在创建客户端后应用")
+
+    elif args.stage == "full":
+        # ===== 完整训练（原有逻辑） =====
+        if args.pretrained_path is not None and os.path.exists(args.pretrained_path):
+            print(f"  [Full Training] 使用小学习率微调（不冻结embedding）")
+            print(f"  原因: 需要embedding与多模态特征对齐")
+            print(f"  ✓ 所有参数保持可训练，使用学习率{args.learning_rate}")
+        else:
+            print(f"  [Full Training] 从零开始训练")
+            print(f"  ✓ 所有参数可训练")
+
+    # ============================================
+    # 3.5. [UPDATED] 创建FedMem客户端 (在checkpoint加载和模型更新之后)
+    # ============================================
+    print("\n[3.5/4] 创建 FedMem 客户端...")
 
     # [NEW] 传递多模态特征到客户端
     clients = create_fedmem_clients(
@@ -654,6 +946,91 @@ def main():
         item_text_feats=item_text_feats,      # [NEW]
         args=args
     )
+
+    # ============================================
+    # 3.6. [三阶段训练] 参数冻结策略 (客户端已创建)
+    # ============================================
+    if args.stage == "align_projectors":
+        print(f"\n[3.6/4] 应用Stage 2冻结策略（轻量级对齐）...")
+        print(f"  ✓ 目标: 训练投影层，将多模态特征对齐到ID空间")
+        print(f"  ✓ 参数量: <200K (vs 原方案 ~4M)")
+        print(f"  冻结: SASRec + Item Embedding + Experts + CrossModalFusion + Router")
+        print(f"  训练: visual_proj (512→128) + text_proj (384→128) + align_gating MLP")
+
+        # 应用冻结策略到所有客户端
+        for client in clients:
+            client._ensure_model_initialized()
+            frozen_params = []
+            trainable_params_names = []
+
+            for name, param in client.model.named_parameters():
+                k = name.lower()
+                # [Stage 2核心] 只训练投影层和对齐门控
+                if 'visual_proj' in k or 'text_proj' in k or 'align_gating' in k:
+                    param.requires_grad = True
+                    trainable_params_names.append(name)
+                else:
+                    # 冻结其他所有参数：SASRec, Experts, CrossModalFusion, Router, LayerNorms, Gating Weight
+                    param.requires_grad = False
+                    frozen_params.append(name)
+
+            # 重建优化器（只包含可训练参数）
+            trainable_params = [p for p in client.model.parameters() if p.requires_grad]
+            client.optimizer = torch.optim.Adam(
+                trainable_params,
+                lr=client.learning_rate,
+                weight_decay=client.weight_decay
+            )
+
+            # 统计可训练参数数量
+            if client.client_id == list(user_sequences.keys())[0]:  # 只打印第一个客户端
+                num_trainable = sum(p.numel() for p in trainable_params)
+                print(f"  示例客户端 {client.client_id}:")
+                print(f"    - 冻结参数: {len(frozen_params)}个")
+                print(f"    - 可训练参数: {len(trainable_params_names)}个 (~{num_trainable:,} params)")
+                print(f"    - 可训练层: {', '.join(trainable_params_names)}")
+
+        print(f"  ✓ 所有 {len(clients)} 个客户端已应用Stage 2轻量级冻结策略")
+
+    elif args.stage == "finetune_moe":
+        print(f"\n[3.6/4] 应用Stage 3冻结策略（MoE全局微调）...")
+        print(f"  ✓ 目标: 学习Router权重，微调所有组件")
+        print(f"  冻结: Item Embedding（保持ID空间稳定）")
+        print(f"  训练: SASRec Transformer + Projectors + Experts + CrossModalFusion + Router")
+
+        # 应用冻结策略到所有客户端
+        for client in clients:
+            client._ensure_model_initialized()
+            frozen_params = []
+            trainable_params_names = []
+
+            for name, param in client.model.named_parameters():
+                # [Stage 3核心] 只冻结Item Embedding，其他全部训练
+                if 'item_emb' in name.lower() or 'item_embedding' in name.lower():
+                    param.requires_grad = False
+                    frozen_params.append(name)
+                else:
+                    param.requires_grad = True
+                    trainable_params_names.append(name)
+
+            # 重建优化器（只包含可训练参数）
+            trainable_params = [p for p in client.model.parameters() if p.requires_grad]
+            client.optimizer = torch.optim.Adam(
+                trainable_params,
+                lr=client.learning_rate,
+                weight_decay=client.weight_decay
+            )
+
+            # 统计参数
+            if client.client_id == list(user_sequences.keys())[0]:  # 只打印第一个客户端
+                num_trainable = sum(p.numel() for p in trainable_params)
+                num_frozen = sum(p.numel() for p in client.model.parameters() if not p.requires_grad)
+                print(f"  示例客户端 {client.client_id}:")
+                print(f"    - 冻结参数: {len(frozen_params)}个 (~{num_frozen:,} params) - Item Embedding")
+                print(f"    - 可训练参数: {len(trainable_params_names)}个 (~{num_trainable:,} params)")
+                print(f"    - 主要可训练模块: SASRec Transformer, Projectors, Experts, Router, CrossModalFusion")
+
+        print(f"  ✓ 所有 {len(clients)} 个客户端已应用Stage 3冻结策略")
 
     # ============================================
     # 4. 创建FedMem服务器并开始训练
@@ -728,8 +1105,8 @@ def main():
         print(f"  {key}: {value:.4f}")
 
     best_metrics = server.get_best_metrics()
-    print(f"\n最佳验证轮次: {best_metrics.get('round', -1) + 1}")
-    print("最佳验证指标:")
+    dprint(f"\n最佳验证轮次: {best_metrics.get('round', -1) + 1}")
+    dprint("最佳验证指标:")
     for key, value in best_metrics.items():
         if key != 'round':
             print(f"  {key}: {value:.4f}")

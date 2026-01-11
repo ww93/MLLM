@@ -71,9 +71,9 @@ def main():
         "local_epochs": 1,
         "patience": 10,
 
-        # [FIX] 训练参数 - 降低学习率用于继续训练
-        "learning_rate": 1e-3,  # 从5e-3降低到1e-3（已经训练15轮，需要更小的学习率）
-        "weight_decay": 1e-5,
+        # [方案A] 训练参数 - 使用小学习率微调（允许embedding继续学习）
+        "learning_rate": 1e-4,  # 使用1e-4进行微调，允许与多模态特征对齐
+        "weight_decay": 1e-4,  # 增加权重衰减防止过拟合
         "batch_size": 64,
         "num_negatives": 4,  # [加速优化3] 训练时仅用4个负样本（评估时仍用100个）
 

@@ -49,13 +49,13 @@ def main():
 
         # [关键] FedMem参数 - 禁用对比学习
         "memory_capacity": 50,  # 记忆容量保留（但不会触发对比学习）
-        "surprise_threshold": 0.3,
+        "surprise_threshold": 0.5,
         "contrastive_lambda": 0.0,  # ❗关键: 设为0禁用对比学习
         "num_memory_prototypes": 5,
         # 不启用prototype_aggregation（默认False）
 
         # [优化] 联邦学习参数 - 快速收敛
-        "num_rounds": 15,  # 预训练只需15轮（比FedDMMR的20轮少）
+        "num_rounds": 20,  # 预训练只需15轮（比FedDMMR的20轮少）
         "client_fraction": 0.2,  # 每轮20%客户端（200个，加速训练）
         "local_epochs": 1,
         "patience": 10,

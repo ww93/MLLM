@@ -60,21 +60,24 @@ def main():
         "local_epochs": 1,
         "patience": 10,
 
-        # 训练参数
-        "learning_rate": 1e-3,
-        "weight_decay": 1e-5,
+        # [方案A] 训练参数 - 使用小学习率微调预训练模型
+        "learning_rate": 1e-4,  # 小学习率允许embedding与多模态特征对齐
+        "weight_decay": 1e-4,   # 增加正则化防止过拟合
         "batch_size": 32,
-        "num_negatives": 100,
+        "num_negatives": 4,     # [加速优化3] 训练时4个负样本
 
         # 评估参数
         "use_negative_sampling": "true",
-        "num_negatives_eval": 100,
+        "num_negatives_eval": 100,  # 评估时仍用100个
 
         # Residual Enhancement参数
         "gating_init": 1.0,  # [FIX 1] 修复后默认值
 
-        # [NEW] 预训练权重路径（可选，如果存在则自动加载）
-        # "pretrained_path": "checkpoints/fedsasrec_pretrain/fedmem_model.pt",
+        # [方案A] 预训练权重路径 - 使用小学习率继续训练（不冻结）
+        "pretrained_path": "UR4Rec/checkpoints/fedsasrec_pretrain/fedmem_model.pt",
+
+        # [关键] 跳过Warmup阶段（已完成预训练）
+        "partial_aggregation_warmup_rounds": 0,
 
         # 其他参数
         "seed": 42,

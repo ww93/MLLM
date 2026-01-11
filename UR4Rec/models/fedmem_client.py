@@ -7,6 +7,7 @@ FedMem Client: Federated Learning Client with Local Dynamic Memory
 - Memory Prototypes提取与聚合
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -127,9 +128,9 @@ class FedMemClient:
         # 负采样
         num_negatives: int = 100,
         num_items: int = 1682,
-        # 记忆参数
-        memory_capacity: int = 50,
-        surprise_threshold: float = 0.5,
+        # 记忆参数 (Two-tier: ST + LT)
+        memory_capacity: int = 200,         # LT (long-term) 容量 (推荐200 for ML-1M)
+        surprise_threshold: float = 0.5,    # 兼容参数，新版本主要使用novelty
         contrastive_lambda: float = 0.1,
         num_memory_prototypes: int = 5,
         # 负采样评估参数
@@ -151,10 +152,10 @@ class FedMemClient:
             max_seq_len: 最大序列长度
             num_negatives: 负样本数量
             num_items: 物品总数
-            memory_capacity: 记忆容量
-            surprise_threshold: 惊喜阈值
+            memory_capacity: LT (long-term) 记忆容量，推荐200 (ML-1M)
+            surprise_threshold: 兼容参数，新版本主要使用novelty-based写入
             contrastive_lambda: 对比学习损失权重
-            num_memory_prototypes: 记忆原型数量
+            num_memory_prototypes: 记忆原型数量（从LT提取）
         """
         self.client_id = client_id
         self.device = device
@@ -167,13 +168,16 @@ class FedMemClient:
         self.weight_decay = weight_decay
         self.contrastive_lambda = contrastive_lambda
         self.num_memory_prototypes = num_memory_prototypes
+        # 调试开关：默认关闭，可通过环境变量 FEDMEM_DEBUG=1 打开
+        self._debug = bool(int(os.environ.get('FEDMEM_DEBUG', '0')))
+
 
         # [NEW] 存储多模态特征
         self.item_visual_feats = item_visual_feats
         self.item_text_feats = item_text_feats
 
         # [FIX 3] 完整性检查：验证多模态特征是否正确加载
-        if client_id == 0:  # 只在第一个客户端打印，避免日志过多
+        if getattr(self, '_debug', False) and client_id == 0:  # 只在第一个客户端打印，避免日志过多
             print(f"\n[FIX 3] 客户端 {client_id} 多模态特征完整性检查:")
             if self.item_visual_feats is not None:
                 print(f"  ✓ 视觉特征已加载: shape={self.item_visual_feats.shape}, "
@@ -205,6 +209,8 @@ class FedMemClient:
 
         # 本地数据
         self.user_sequence = user_sequence
+        # [Critical Fix] 缓存用户历史交互集合，用于负采样时排除
+        self.user_items = set(user_sequence)  # 快速查找O(1)
         self.train_dataset = ClientDataset(
             client_id, user_sequence, max_seq_len, split="train"
         )
@@ -218,19 +224,44 @@ class FedMemClient:
         # 用于计算训练权重
         self.num_train_samples = len(self.train_dataset)
 
-        # 【FedMem核心】初始化本地动态记忆
+        # 【FedMem核心】初始化本地动态记忆 (Two-tier: ST + LT)
+        # - ST (short-term): FIFO, capacity=50, 捕获最近兴趣
+        # - LT (long-term): novelty-gated, capacity=memory_capacity, 稳定多样性存储
+
+        # [FIX] 推断特征维度，用于empty memory时返回正确形状的零张量
+        id_emb_dim = getattr(model, 'sasrec_hidden_dim', 128)  # 从模型获取ID嵌入维度
+        visual_emb_dim = item_visual_feats.shape[1] if item_visual_feats is not None else 512
+        text_emb_dim = item_text_feats.shape[1] if item_text_feats is not None else 384
+
         self.local_memory = LocalDynamicMemory(
-            capacity=memory_capacity,
-            surprise_threshold=surprise_threshold,
-            device=device
+            capacity=memory_capacity,           # LT容量 (推荐200)
+            surprise_threshold=surprise_threshold,  # 兼容参数
+            device=device,
+            # [FIX] 传入特征维度，确保empty memory时返回正确形状
+            id_emb_dim=id_emb_dim,
+            visual_emb_dim=visual_emb_dim,
+            text_emb_dim=text_emb_dim
+            # 其他参数使用数据驱动的默认值 (见local_dynamic_memory.py)
         )
 
     def _ensure_model_initialized(self):
         """确保模型已初始化（延迟实例化）"""
         if self.model is None:
             self.model = copy.deepcopy(self._model_reference).to(self.device)
+
+            # [方案2调试] 验证客户端模型的维度
+            if self.client_id == 0 and hasattr(self.model, 'visual_expert'):
+                print(f"\n[方案2调试] 客户端 {self.client_id} 模型维度验证:")
+                print(f"  preserve_multimodal_dim: {self.model.preserve_multimodal_dim}")
+                print(f"  visual_expert.output_dim: {self.model.visual_expert.output_dim}")
+                print(f"  semantic_expert.output_dim: {self.model.semantic_expert.output_dim}")
+                print(f"  vis_layernorm.normalized_shape: {self.model.vis_layernorm.normalized_shape}")
+                print(f"  sem_layernorm.normalized_shape: {self.model.sem_layernorm.normalized_shape}")
+
+            # [优化4] 冻结embeddings后，只优化requires_grad=True的参数
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
             self.optimizer = optim.Adam(
-                self.model.parameters(),
+                trainable_params,
                 lr=self.learning_rate,
                 weight_decay=self.weight_decay
             )
@@ -241,6 +272,67 @@ class FedMemClient:
                 self.scaler = torch.cuda.amp.GradScaler()
             else:
                 self.scaler = None
+
+    def freeze_embeddings_for_alignment(self):
+        """
+        [新策略] 冻结ID Embedding，训练多模态投影层以对齐到ID空间
+
+        核心思想:
+        - 预训练的ID embedding已经学到了良好的物品表示空间
+        - 冻结ID embedding，防止多模态特征破坏这个空间
+        - 训练visual_proj和text_proj，让多模态特征对齐到ID空间
+
+        冻结策略:
+        - 冻结: item_embedding, positional_embedding (保持ID空间稳定)
+        - 保持可训练: Transformer blocks, visual_proj, text_proj, Router, Experts
+
+        适用场景: 有高质量的预训练ID embedding时使用
+
+        调用时机: 在加载预训练权重后立即调用
+        """
+        self._ensure_model_initialized()
+
+        frozen_params = []
+        trainable_params = []
+
+        for name, param in self.model.named_parameters():
+            # 只冻结embedding层（ID空间）
+            if 'item_emb' in name.lower() or 'positional_emb' in name.lower():
+                param.requires_grad = False
+                frozen_params.append(name)
+            else:
+                # 其他层全部保持可训练（包括投影层、Transformer、Router、Experts）
+                param.requires_grad = True
+                trainable_params.append(name)
+
+        # 重新创建优化器（只包含可训练参数）
+        trainable_params_list = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = optim.Adam(
+            trainable_params_list,
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+
+        print(f"[对齐策略] 客户端 {self.client_id} - 冻结ID Embedding，训练投影层:")
+        print(f"  ❄️  冻结参数数: {len(frozen_params)}")
+        print(f"  🔥 可训练参数数: {len(trainable_params)}")
+        if len(frozen_params) > 0:
+            print(f"  冻结层: {', '.join(frozen_params[:5])}")
+
+        # 统计可训练的投影层参数
+        proj_params = [name for name in trainable_params if 'proj' in name.lower()]
+        if proj_params:
+            print(f"  ✓ 投影层可训练: {len(proj_params)}个 (用于对齐到ID空间)")
+
+    def freeze_embeddings(self):
+        """
+        [已废弃] 完全冻结embedding层
+
+        注意: 此方法已被 freeze_embeddings_for_alignment() 替代
+        新方法允许投影层训练，效果更好
+        """
+        # 兼容性保留，调用新方法
+        self.freeze_embeddings_for_alignment()
 
     def release_model(self):
         """释放模型内存"""
@@ -298,19 +390,18 @@ class FedMemClient:
         verbose: bool = False
     ) -> Dict[str, float]:
         """
-        【FedMem核心】在本地数据上训练模型，同时更新动态记忆
+        在本地数据上训练模型，同时更新动态记忆。
 
-        训练流程：
-        1. 前向传播，计算推荐损失（rec_loss）和对比学习损失（contrastive_loss）
-        2. 总损失 = rec_loss + lambda * contrastive_loss
-        3. 反向传播，更新模型参数
-        4. 根据Surprise（rec_loss）更新本地记忆
+        训练采用 **显式负采样**（与经典 SASRec / NCF 评估协议一致）：
+        - 对每个正样本采样 num_negatives 个负样本，构造候选集 [pos + negs]
+        - logits: [B, 1+N]，标签恒为 0
+        - 训练时可选加入“模态对齐损失”（Stage 2/3）：让多模态融合表示对齐冻结的 ID embedding 空间
 
         Args:
-            verbose: 是否打印训练信息
+            verbose: 是否打印训练信息（默认关闭；建议仅 client_id==0 打开）
 
         Returns:
-            training_metrics: 训练指标
+            dict: 训练指标
         """
         self._ensure_model_initialized()
         self.model.train()
@@ -322,188 +413,138 @@ class FedMemClient:
         )
 
         total_rec_loss = 0.0
-        total_contrastive_loss = 0.0
-        total_loss = 0.0
+        total_align_loss = 0.0
         num_batches = 0
 
-        for epoch in range(self.local_epochs):
+        for _ in range(self.local_epochs):
             epoch_rec_loss = 0.0
-            epoch_contrastive_loss = 0.0
+            epoch_align_loss = 0.0
 
             for batch in train_loader:
                 user_ids = batch['user_id'].tolist()
                 item_seqs = batch['item_seq'].to(self.device)
-                target_items = batch['target_item'].to(self.device)
+                target_items = batch['target_item'].to(self.device)  # [B]
+                bsz = target_items.size(0)
 
-                batch_size = item_seqs.size(0)
+                # 1) 负采样：构造候选集 [B, 1+N]
+                neg_items = self._negative_sampling(batch_size=bsz, target_items=target_items)  # [B, N]
+                candidate_items = torch.cat([target_items.unsqueeze(1), neg_items], dim=1)      # [B, 1+N]
+                labels = torch.zeros(bsz, dtype=torch.long, device=self.device)                # 正样本恒在第0列
 
-                # 负采样
-                neg_items = self._negative_sampling(batch_size, target_items)
+                # 2) 记忆检索（可为空）
+                memory_visual, memory_text = self._retrieve_multimodal_memory_batch(
+                    batch_size=bsz,
+                    top_k=20
+                )
 
-                # 准备候选items：[target, neg1, neg2, ...]
-                all_candidates = torch.cat([
-                    target_items.unsqueeze(1),  # [B, 1]
-                    neg_items  # [B, N]
-                ], dim=1)  # [B, 1+N]
+                # 3) 候选多模态特征（可为空）
+                cand_visual = self._get_candidate_visual_features(candidate_items)
+                cand_text = self._get_candidate_text_features(candidate_items)
 
-                # ===========================
-                # [加速优化1] 前向传播（FedDMMR） - 使用混合精度
-                # ===========================
-                # 使用autocast自动选择合适的精度
-                with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
-                    # 【NEW】从本地记忆检索多模态特征
-                    memory_visual, memory_text = self._retrieve_multimodal_memory_batch(
-                        batch_size=batch_size,
-                        top_k=20
-                    )
+                # 4) 前向 + 损失
+                self.optimizer.zero_grad()
 
-                    # 【NEW】获取候选物品的多模态特征
-                    target_visual = self._get_candidate_visual_features(all_candidates)
-                    target_text = self._get_candidate_text_features(all_candidates)
-
-                    # 【NEW】使用FedDMMR的新forward接口
-                    final_scores, info = self.model(
+                with torch.amp.autocast('cuda', enabled=(self.scaler is not None)):
+                    logits, info = self.model(
                         user_ids=user_ids,
                         input_seq=item_seqs,
-                        target_items=all_candidates,
-                        memory_visual=memory_visual,    # [B, 20, img_dim] 或 None
-                        memory_text=memory_text,        # [B, 20, text_dim] 或 None
-                        target_visual=target_visual,    # [B, N, img_dim] 或 None
-                        target_text=target_text,        # [B, N, text_dim] 或 None
-                        return_components=True  # 需要获取lb_loss
+                        target_items=candidate_items,   # [B, 1+N]
+                        memory_visual=memory_visual,
+                        memory_text=memory_text,
+                        target_visual=cand_visual,
+                        target_text=cand_text,
+                        return_components=True,
+                        training_mode=False             # 显式负采样：必须 False
                     )
 
-                    # 提取负载均衡损失和中间表示
-                    lb_loss = info['lb_loss']
-                    vis_out = info['vis_out']  # [B, 1+N, D] 视觉专家输出
-                    sem_out = info['sem_out']  # [B, 1+N, D] 语义专家输出
+                    # 推荐损失
+                    lb_loss = info.get('lb_loss', None) if isinstance(info, dict) else None
+                    rec_loss, _ = self.model.compute_loss(logits, labels, lb_loss=None)
 
-                    # 计算推荐损失（使用BPR loss）
-                    # all_candidates: [B, 1+N]，第0列是正样本，其余是负样本
-                    labels = torch.zeros(batch_size, dtype=torch.long, device=self.device)  # 正样本索引都是0
-                    rec_loss, _ = self.model.compute_loss(final_scores, labels, lb_loss=None)
+                    # “模态对齐”损失（Stage 2/3）：默认用 contrastive_lambda 作为权重
+                    # 取模型返回的 fused_repr / auxiliary_repr / seq_out (优先 fused_repr)
+                    align_loss = torch.tensor(0.0, device=self.device)
+                    if self.contrastive_lambda > 0.0 and isinstance(info, dict):
+                        rep = info.get('fused_repr', None)
+                        if rep is None:
+                            rep = info.get('auxiliary_repr', None)
+                        if rep is None:
+                            rep = info.get('seq_out', None)
 
-                # ===========================
-                # 计算惊讶度分数 (Surprise Score)
-                # ===========================
-                # 当推荐损失高时，说明模型对当前样本"惊讶"，可能是兴趣漂移
-                # 使用sigmoid将rec_loss归一化到[0, 1]
-                # 关键：detach()确保梯度不会回传到surprise计算
-                surprise = torch.sigmoid(rec_loss).detach()  # 标量 -> [1]
+                        if rep is not None:
+                            # rep: [B, 1+N, D] -> 正样本为第0列
+                            pos_rep = rep[:, 0, :] if rep.dim() == 3 else rep  # [B, D]
 
-                # 扩展为batch维度
-                surprise_batch = surprise.unsqueeze(0).expand(batch_size)  # [B]
+                            # 冻结的 ID embedding 作为锚点
+                            id_emb = self._get_item_id_emb_batch(target_items)  # [B, D] 或 None
+                            if id_emb is not None:
+                                pos_rep_n = torch.nn.functional.normalize(pos_rep, dim=-1)
+                                id_emb_n = torch.nn.functional.normalize(id_emb, dim=-1)
+                                cos = (pos_rep_n * id_emb_n).sum(dim=-1)  # [B]
+                                # surprise 加权（困难样本更强调对齐）
+                                # rec_loss 是 batch mean；这里用 per-sample 的 CE loss 作为 surprise 的近似
+                                with torch.no_grad():
+                                    per_sample_ce = -torch.log_softmax(logits.detach(), dim=1)[:, 0]
+                                    surprise = torch.sigmoid(per_sample_ce)  # [B] in (0,1)
+                                weights = 1.0 + 0.5 * surprise
+                                align_loss = ((1.0 - cos) * weights).mean()
 
-                # ===========================
-                # [FIX 2] 计算漂移自适应对比学习损失 (Drift-Adaptive Contrastive Loss)
-                # ===========================
-                with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
-                    # 提取正样本（第0个候选物品）的视觉和语义表示
-                    vis_pos = vis_out[:, 0, :]  # [B, D] 正样本的视觉表示
-                    sem_pos = sem_out[:, 0, :]  # [B, D] 正样本的语义表示
+                    lb = lb_loss if lb_loss is not None else torch.tensor(0.0, device=self.device)
+                    loss = rec_loss + self.contrastive_lambda * align_loss + 0.01 * lb
 
-                    # 调用模型的compute_contrastive_loss方法
-                    # [FIX 2] 修复: 不再使用自适应温度，而是返回实例权重
-                    contrastive_loss, instance_weights = self.model.compute_contrastive_loss(
-                        vis_repr=vis_pos,
-                        sem_repr=sem_pos,
-                        surprise_score=surprise_batch,
-                        base_temp=0.07,
-                        alpha=0.5  # 权重调节系数: weights = 1.0 + 0.5 * surprise
-                    )
-
-                    # [FIX 2] 应用实例权重到对比学习损失
-                    # 修复前: loss = rec_loss + λ * contrastive_loss
-                    # 修复后: 困难样本(高surprise)获得更高的对比学习权重
-                    if instance_weights is not None:
-                        # 重新计算每个样本的损失，应用权重后再平均
-                        # 注意: contrastive_loss已经是均值，这里需要重新获取per_sample_loss
-                        # 为了简化，我们直接对整体损失进行调整
-                        # weighted_cl_loss = contrastive_loss * instance_weights.mean()
-                        # 但更正确的做法是在compute_contrastive_loss内部返回per_sample_loss
-                        # 这里我们使用一个简化版本：用平均权重缩放
-                        avg_weight = instance_weights.mean()
-                        weighted_contrastive_loss = contrastive_loss * avg_weight
-                    else:
-                        weighted_contrastive_loss = contrastive_loss
-
-                    # ===========================
-                    # 总损失（加入负载均衡损失）
-                    # ===========================
-                    loss = rec_loss + self.contrastive_lambda * weighted_contrastive_loss + 0.01 * lb_loss
-
-                # ===========================
-                # [加速优化1] 反向传播 - 使用GradScaler
-                # ===========================
-                self.optimizer.zero_grad()
+                # 5) 反向传播
                 if self.scaler is not None:
-                    # 使用scaler进行混合精度的反向传播
                     self.scaler.scale(loss).backward()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    # CPU模式，正常反向传播
                     loss.backward()
                     self.optimizer.step()
 
-                # ===========================
-                # 【Surprise-based Memory Update】
-                # ===========================
-                # 对于每个样本，如果rec_loss超过阈值，则更新记忆
+                # 6) Two-tier Memory Update（ST always, LT when novelty is high）
                 with torch.no_grad():
-                    # 使用正样本的得分来计算surprise
-                    # final_scores: [B, 1+N], 第0列是正样本
-                    pos_scores = final_scores[:, 0]  # [B]
-                    neg_scores = final_scores[:, 1:]  # [B, N]
-
-                    # 计算每个样本的损失（用于Surprise判断）
-                    sample_losses = -torch.log(
-                        torch.sigmoid(pos_scores.unsqueeze(1) - neg_scores) + 1e-10
-                    ).mean(dim=1)  # [B]
-
-                    for i in range(batch_size):
-                        item_id = target_items[i].item()
-                        loss_val = sample_losses[i].item()
-
-                        # 提取嵌入（如果模型支持）
-                        text_emb = self._get_item_text_emb(item_id)
-                        img_emb = self._get_item_img_emb(item_id)
-                        id_emb = self._get_item_id_emb(item_id)
-
-                        # 更新记忆
+                    per_sample_loss = -torch.log_softmax(logits, dim=1)[:, 0]  # [B]
+                    for i in range(bsz):
+                        item_id = int(target_items[i].item())
+                        loss_val = float(per_sample_loss[i].item())
+                        # [Memory Update] 新版本参数顺序: (item_id, id_emb, visual_emb, text_emb, loss_val)
                         self.local_memory.update(
                             item_id=item_id,
-                            loss_val=loss_val,
-                            text_emb=text_emb,
-                            img_emb=img_emb,
-                            id_emb=id_emb
+                            id_emb=self._get_item_id_emb(item_id),
+                            visual_emb=self._get_item_img_emb(item_id),  # 参数名从 img_emb 改为 visual_emb
+                            text_emb=self._get_item_text_emb(item_id),
+                            loss_val=loss_val
                         )
 
-                # 累积损失
-                epoch_rec_loss += rec_loss.item()
-                epoch_contrastive_loss += contrastive_loss.item()
+                epoch_rec_loss += float(rec_loss.item())
+                epoch_align_loss += float(align_loss.item())
                 num_batches += 1
 
-            total_rec_loss += epoch_rec_loss / len(train_loader)
-            total_contrastive_loss += epoch_contrastive_loss / len(train_loader)
+            epoch_rec_loss /= max(1, len(train_loader))
+            epoch_align_loss /= max(1, len(train_loader))
+            total_rec_loss += epoch_rec_loss
+            total_align_loss += epoch_align_loss
 
-        # 平均损失
-        avg_rec_loss = total_rec_loss / self.local_epochs
-        avg_contrastive_loss = total_contrastive_loss / self.local_epochs
-        avg_total_loss = avg_rec_loss + self.contrastive_lambda * avg_contrastive_loss
+        avg_rec_loss = total_rec_loss / max(1, self.local_epochs)
+        avg_align_loss = total_align_loss / max(1, self.local_epochs)
+        avg_total_loss = avg_rec_loss + self.contrastive_lambda * avg_align_loss
 
         metrics = {
             'loss': avg_total_loss,
             'rec_loss': avg_rec_loss,
-            'contrastive_loss': avg_contrastive_loss,
+            # 保持原字段名，避免 server 端日志/画图断掉
+            'contrastive_loss': avg_align_loss,
             'memory_size': len(self.local_memory),
-            'memory_updates': self.local_memory.total_updates
+            # [Two-tier兼容] total_updates = ST updates + LT updates
+            'memory_updates': self.local_memory.total_updates_st + self.local_memory.total_updates_lt
         }
 
         if verbose:
-            print(f"Client {self.client_id} | Loss: {avg_total_loss:.4f} "
-                  f"(Rec: {avg_rec_loss:.4f}, Contrast: {avg_contrastive_loss:.4f}) | "
-                  f"Memory: {len(self.local_memory)}/{self.local_memory.capacity}")
+            print(
+                f"Client {self.client_id} | Loss: {avg_total_loss:.4f} "
+                f"(Rec: {avg_rec_loss:.4f}, Align: {avg_align_loss:.4f}) | "
+                f"Memory: {len(self.local_memory)}/{self.local_memory.capacity}"
+            )
 
         return metrics
 
@@ -526,20 +567,29 @@ class FedMemClient:
         top_k: int = 20
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        【FedDMMR专用】从本地记忆中批量检索多模态特征
+        【FedDMMR专用】从本地记忆中批量检索多模态特征（Two-tier: ST + LT）
 
         Args:
             batch_size: 批大小
-            top_k: 返回Top-K个记忆
+            top_k: 返回Top-K个记忆（默认从ST和LT混合检索）
 
         Returns:
             memory_visual: [B, TopK, img_dim] 或 None
             memory_text: [B, TopK, text_dim] 或 None
+
+        Note:
+            新版本memory返回4个值 (mem_vis, mem_txt, mem_id, mask)，
+            此wrapper方法只返回前2个以保持向后兼容性。
         """
-        return self.local_memory.retrieve_multimodal_memory_batch(
+        # [Memory Retrieval] 新版本返回4个值：(mem_vis, mem_txt, mem_id, mask)
+        mem_vis, mem_txt, mem_id, mask = self.local_memory.retrieve_multimodal_memory_batch(
             batch_size=batch_size,
             top_k=top_k
         )
+
+        # 向后兼容：只返回visual和text（忽略mem_id和mask）
+        # 如果需要mask或id_emb，可以扩展此接口
+        return mem_vis, mem_txt
 
     def _get_candidate_visual_features(
         self,
@@ -642,6 +692,41 @@ class FedMemClient:
             # 回退：返回0损失
             return torch.tensor(0.0, device=self.device)
 
+    def _get_item_id_emb_batch(self, item_ids: torch.Tensor) -> Optional[torch.Tensor]:
+        """
+        批量获取物品的 ID embedding（用于 Stage 2/3 的对齐损失）
+
+        Args:
+            item_ids: [B] 或 [B, 1] 的 item ids
+
+        Returns:
+            [B, D] 或 None
+        """
+        self._ensure_model_initialized()
+        if item_ids is None:
+            return None
+        if item_ids.dim() > 1:
+            item_ids = item_ids.view(-1)
+        item_ids = item_ids.to(self.device)
+
+        # 优先使用模型提供的接口
+        if hasattr(self.model, 'get_item_embeddings'):
+            with torch.no_grad():
+                emb = self.model.get_item_embeddings(item_ids, embedding_type='id')
+            if emb is not None:
+                if emb.dim() == 3:
+                    emb = emb.squeeze(1)
+                return emb
+
+        # 回退：访问 SASRec 内部 embedding
+        try:
+            if hasattr(self.model, 'sasrec') and hasattr(self.model.sasrec, 'item_embedding'):
+                with torch.no_grad():
+                    return self.model.sasrec.item_embedding(item_ids)
+        except Exception:
+            return None
+        return None
+
     def _get_item_text_emb(self, item_id: int) -> Optional[torch.Tensor]:
         """
         获取物品的文本嵌入
@@ -696,40 +781,55 @@ class FedMemClient:
         target_items: torch.Tensor
     ) -> torch.Tensor:
         """
-        [加速优化3] 优化后的负采样（批量化处理，避免逐样本循环）
+        [Critical Fix] 负采样：排除用户历史交互的所有物品
+
+        在联邦单用户客户端场景下，必须排除用户的完整历史交互，而不仅仅是target_item。
+        否则会产生"伪负样本"：用户交互过的物品被当作负样本，破坏训练信号。
 
         Args:
             batch_size: 批大小
             target_items: [B] 正样本item IDs
 
         Returns:
-            neg_items: [B, num_negatives]
+            neg_items: [B, num_negatives] 保证不在用户历史中的负样本
         """
-        # [优化3] 一次性生成所有负样本（过采样以确保足够）
-        # 为每个样本生成2倍的候选，然后过滤
+        # [Critical Fix] 一次性生成所有负样本（过采样10倍以确保足够）
+        # 因为需要排除用户历史，可能需要多次采样
         all_candidates = torch.randint(
             1, self.num_items,
-            (batch_size, self.num_negatives * 2),
+            (batch_size, self.num_negatives * 10),  # 10倍过采样
             device=self.device
-        )  # [B, num_negatives*2]
+        )  # [B, num_negatives*10]
 
-        # 创建正样本的mask：[B, num_negatives*2]
-        pos_mask = all_candidates == target_items.unsqueeze(1)
+        # [Critical Fix] 创建用户历史物品的mask
+        # 对于联邦学习，batch内所有样本都来自同一用户，使用相同的user_items
+        user_items_tensor = torch.tensor(list(self.user_items), device=self.device)  # [|history|]
 
-        # 将正样本位置设置为0（无效item id）
-        all_candidates[pos_mask] = 0
-
-        # 对于每个样本，选择前num_negatives个非零候选
+        # 对于每个样本，选择不在用户历史中的负样本
         neg_items = []
         for i in range(batch_size):
-            valid_negs = all_candidates[i][all_candidates[i] != 0]
+            candidates = all_candidates[i]  # [num_negatives*10]
+
+            # [Critical Fix] 排除用户历史：使用set membership check
+            # 方法：将候选转为CPU numpy，快速过滤，再转回GPU
+            candidates_np = candidates.cpu().numpy()
+            valid_mask = np.array([item not in self.user_items for item in candidates_np])
+            valid_negs = candidates[torch.from_numpy(valid_mask)]
+
             if len(valid_negs) >= self.num_negatives:
+                # 有足够的有效负样本
                 neg_items.append(valid_negs[:self.num_negatives])
             else:
-                # 如果不够，补充随机采样（极少发生）
-                need_more = self.num_negatives - len(valid_negs)
-                extra = torch.randint(1, self.num_items, (need_more,), device=self.device)
-                neg_items.append(torch.cat([valid_negs, extra]))
+                # [极少情况] 不够，继续采样直到足够
+                # 这种情况在用户历史很长时可能发生
+                collected = valid_negs.tolist()
+                while len(collected) < self.num_negatives:
+                    # 采样单个候选并检查
+                    candidate = torch.randint(1, self.num_items, (1,), device=self.device).item()
+                    if candidate not in self.user_items:
+                        collected.append(candidate)
+
+                neg_items.append(torch.tensor(collected[:self.num_negatives], device=self.device))
 
         return torch.stack(neg_items)  # [B, num_negatives]
 

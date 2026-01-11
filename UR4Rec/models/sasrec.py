@@ -131,7 +131,9 @@ class SASRec(nn.Module):
         num_blocks: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
-        max_seq_len: int = 50
+        max_seq_len: int = 50,
+        input_dim: Optional[int] = None,       # [NEW] 外部embedding维度
+        use_external_emb: bool = False         # [NEW] 是否使用外部embedding
     ):
         """
         Args:
@@ -141,19 +143,35 @@ class SASRec(nn.Module):
             num_heads: 注意力头数
             dropout: Dropout 率
             max_seq_len: 最大序列长度
+            input_dim: 外部embedding维度（如果使用外部embedding）
+            use_external_emb: 是否使用外部embedding
         """
         super().__init__()
 
         self.num_items = num_items
         self.hidden_dim = hidden_dim
         self.max_seq_len = max_seq_len
+        self.use_external_emb = use_external_emb
+        self.input_dim = input_dim
 
-        # Item Embedding
-        self.item_embedding = nn.Embedding(
-            num_items + 1,  # +1 for padding
-            hidden_dim,
-            padding_idx=0
-        )
+        # Item Embedding（如果不使用外部embedding）
+        if not use_external_emb:
+            self.item_embedding = nn.Embedding(
+                num_items + 1,  # +1 for padding
+                hidden_dim,
+                padding_idx=0
+            )
+        else:
+            # 使用外部embedding时，创建投影层
+            self.item_embedding = nn.Embedding(
+                num_items + 1,  # +1 for padding (保留以兼容某些代码)
+                hidden_dim,
+                padding_idx=0
+            )
+            if input_dim != hidden_dim:
+                self.input_proj = nn.Linear(input_dim, hidden_dim)
+            else:
+                self.input_proj = nn.Identity()
 
         # Positional Embedding
         self.positional_embedding = nn.Embedding(max_seq_len, hidden_dim)
@@ -216,22 +234,36 @@ class SASRec(nn.Module):
         前向传播
 
         Args:
-            input_seq: [batch_size, seq_len] - 输入序列
+            input_seq: [batch_size, seq_len] - 输入序列（item IDs）
+                      或 [batch_size, seq_len, input_dim] - 外部embeddings
             padding_mask: [batch_size, seq_len] - 填充掩码（True表示有效位置）
 
         Returns:
             output: [batch_size, seq_len, hidden_dim] - 序列表示
         """
-        batch_size, seq_len = input_seq.shape
+        # 判断输入是ID序列还是embedding序列
+        if input_seq.dim() == 2:
+            # 输入是ID序列 [B, L]
+            batch_size, seq_len = input_seq.shape
 
-        # Clamp item IDs to valid range to handle out-of-vocabulary items
-        input_seq = torch.clamp(input_seq, 0, self.num_items)
+            # Clamp item IDs to valid range to handle out-of-vocabulary items
+            input_seq = torch.clamp(input_seq, 0, self.num_items)
 
-        # Item Embedding
-        seq_emb = self.item_embedding(input_seq)  # [batch, seq_len, hidden]
+            # Item Embedding
+            seq_emb = self.item_embedding(input_seq)  # [batch, seq_len, hidden]
+        else:
+            # 输入是embedding序列 [B, L, D]
+            batch_size, seq_len, emb_dim = input_seq.shape
+
+            if self.use_external_emb:
+                # 使用投影层
+                seq_emb = self.input_proj(input_seq)  # [batch, seq_len, hidden]
+            else:
+                # 直接使用（假设维度已经匹配）
+                seq_emb = input_seq
 
         # Positional Embedding
-        positions = torch.arange(seq_len, device=input_seq.device).unsqueeze(0)
+        positions = torch.arange(seq_len, device=seq_emb.device).unsqueeze(0)
         pos_emb = self.positional_embedding(positions)  # [1, seq_len, hidden]
 
         # Add embeddings
@@ -239,7 +271,7 @@ class SASRec(nn.Module):
         x = self.dropout(x)
 
         # 创建因果掩码
-        causal_mask = self._create_causal_mask(seq_len).to(input_seq.device)
+        causal_mask = self._create_causal_mask(seq_len).to(seq_emb.device)
 
         # Key padding mask（MultiheadAttention 使用的格式：True表示需要忽略）
         if padding_mask is not None:

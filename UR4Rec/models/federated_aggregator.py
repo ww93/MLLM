@@ -247,9 +247,12 @@ class FederatedAggregator:
         Returns:
             parameters: 参数字典
         """
+        # [方案2修复] 过滤掉临时的对比学习投影层
+        # 这些层是动态创建的，不需要聚合
         return OrderedDict(
             (name, param.detach().clone().cpu())
             for name, param in model.state_dict().items()
+            if not name.startswith('_contrastive_')  # 过滤临时投影层
         )
 
     @staticmethod
@@ -264,7 +267,9 @@ class FederatedAggregator:
             model: PyTorch模型
             parameters: 参数字典
         """
-        model.load_state_dict(parameters, strict=True)
+        # [方案2修复] 使用strict=False以兼容动态创建的临时层
+        # 主要是为了处理 _contrastive_vis_proj 和 _contrastive_sem_proj
+        model.load_state_dict(parameters, strict=False)
 
     def compute_aggregation_quality(
         self,
