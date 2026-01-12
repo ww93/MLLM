@@ -894,13 +894,34 @@ def main():
                 else:
                     state_dict = checkpoint
 
-                # [方案2修复] 加载投影层参数，带形状检查
-                # 原因：旧的Stage 2 checkpoint可能有128-dim experts，但方案2需要512/384-dim
+                # [关键修复] Stage 3只加载投影层和gating，跳过随机的MoE组件
+                # 原因：Stage 2训练时MoE组件（router/expert/fusion）是冻结的（随机状态）
+                #       Stage 3不应该加载这些随机参数，应该用自己的初始化
                 current_state = global_model.state_dict()
                 loaded = 0
                 skipped_shape = []
+                skipped_random_moe = []
                 for key, value in state_dict.items():
-                    if ('proj' in key.lower() or 'expert' in key.lower() or 'cross_modal_fusion' in key.lower()) and key in current_state:
+                    # [Stage 3关键] 只加载Stage 2训练过的组件
+                    # ✓ 加载: visual_proj, text_proj, align_gating, gating_weight
+                    # ✗ 跳过: router, expert, cross_modal_fusion (这些在Stage 2是冻结/随机的)
+                    should_load = (
+                        ('proj' in key.lower() and 'expert' not in key.lower()) or  # 投影层（非Expert内部的proj）
+                        'align_gating' in key.lower() or    # Stage 2训练的对齐门控
+                        'gating_weight' in key.lower()      # 残差融合权重（核心！）
+                    )
+
+                    # 记录跳过的MoE组件（用于调试）
+                    is_moe_component = (
+                        'router' in key.lower() or
+                        'expert' in key.lower() or
+                        'cross_modal_fusion' in key.lower() or
+                        ('layernorm' in key.lower() and any(x in key.lower() for x in ['vis_', 'sem_', 'seq_']))
+                    )
+                    if is_moe_component:
+                        skipped_random_moe.append(key)
+
+                    if should_load and key in current_state:
                         # 形状检查：只加载形状匹配的参数
                         if current_state[key].shape == value.shape:
                             current_state[key] = value
@@ -908,16 +929,29 @@ def main():
                         else:
                             skipped_shape.append(f"{key} (ckpt:{value.shape} vs model:{current_state[key].shape})")
 
+                # 打印跳过的MoE组件（重要调试信息）
+                if skipped_random_moe:
+                    print(f"  ℹ️  跳过Stage 2中随机的MoE组件 ({len(skipped_random_moe)}个):")
+                    print(f"     原因: 这些组件在Stage 2是冻结的（未训练），不应该加载")
+                    print(f"     跳过: router ({sum(1 for k in skipped_random_moe if 'router' in k)}), "
+                          f"expert ({sum(1 for k in skipped_random_moe if 'expert' in k)}), "
+                          f"fusion ({sum(1 for k in skipped_random_moe if 'fusion' in k)}), "
+                          f"layernorm ({sum(1 for k in skipped_random_moe if 'layernorm' in k)})")
+
                 if skipped_shape:
                     print(f"  ℹ️  跳过形状不匹配的参数 ({len(skipped_shape)}个):")
                     for item in skipped_shape[:5]:  # 只显示前5个
                         print(f"     - {item}")
                     if len(skipped_shape) > 5:
                         print(f"     - ... 还有{len(skipped_shape)-5}个")
-                    print(f"  提示: 如果是从旧版Stage 2 checkpoint加载，这是正常的（维度已改变）")
 
                 global_model.load_state_dict(current_state)
                 print(f"  ✓ 成功加载Stage 2权重到global_model ({loaded}个参数)")
+                print(f"     加载: visual_proj, text_proj, align_gating, gating_weight")
+                print(f"     保持Stage 3自己的初始化: router, experts, fusion")
+                # [关键验证] 打印gating_weight实际值
+                if hasattr(global_model, 'gating_weight'):
+                    print(f"  ✓ 验证: gating_weight = {global_model.gating_weight.item():.6f}")
             except Exception as e:
                 print(f"  ✗ 加载Stage 2失败: {e}")
 
@@ -993,44 +1027,22 @@ def main():
         print(f"  ✓ 所有 {len(clients)} 个客户端已应用Stage 2轻量级冻结策略")
 
     elif args.stage == "finetune_moe":
-        print(f"\n[3.6/4] 应用Stage 3冻结策略（MoE全局微调）...")
-        print(f"  ✓ 目标: 学习Router权重，微调所有组件")
-        print(f"  冻结: Item Embedding（保持ID空间稳定）")
-        print(f"  训练: SASRec Transformer + Projectors + Experts + CrossModalFusion + Router")
+        print(f"\n[3.6/4] Stage 3: 三阶段渐进式解冻策略")
+        print(f"  [方案1] 渐进式解冻将在训练过程中动态应用：")
+        print(f"    Stage 3a (Round 0-9):  冻结 SASRec+投影层+Experts+Fusion, 训练 Router")
+        print(f"    Stage 3b (Round 10-29): 冻结 SASRec+投影层, 训练 Router+Experts+Fusion")
+        print(f"    Stage 3c (Round 30-49): 冻结 item_emb, 训练 所有其他参数 (LR=1e-5)")
+        print(f"  ✓ 目标: 渐进解冻，避免破坏Stage 2学到的SASRec-投影层配合")
 
-        # 应用冻结策略到所有客户端
-        for client in clients:
-            client._ensure_model_initialized()
-            frozen_params = []
-            trainable_params_names = []
+        # [关键验证] 检查gating_weight是否正确加载
+        sample_client = clients[0]
+        sample_client._ensure_model_initialized()
+        if hasattr(sample_client.model, 'gating_weight'):
+            print(f"  ✓ 验证: 客户端 {sample_client.client_id} gating_weight = {sample_client.model.gating_weight.item():.6f}")
 
-            for name, param in client.model.named_parameters():
-                # [Stage 3核心] 只冻结Item Embedding，其他全部训练
-                if 'item_emb' in name.lower() or 'item_embedding' in name.lower():
-                    param.requires_grad = False
-                    frozen_params.append(name)
-                else:
-                    param.requires_grad = True
-                    trainable_params_names.append(name)
+        print(f"  ✓ 渐进式冻结策略将在每轮训练时动态应用")
 
-            # 重建优化器（只包含可训练参数）
-            trainable_params = [p for p in client.model.parameters() if p.requires_grad]
-            client.optimizer = torch.optim.Adam(
-                trainable_params,
-                lr=client.learning_rate,
-                weight_decay=client.weight_decay
-            )
-
-            # 统计参数
-            if client.client_id == list(user_sequences.keys())[0]:  # 只打印第一个客户端
-                num_trainable = sum(p.numel() for p in trainable_params)
-                num_frozen = sum(p.numel() for p in client.model.parameters() if not p.requires_grad)
-                print(f"  示例客户端 {client.client_id}:")
-                print(f"    - 冻结参数: {len(frozen_params)}个 (~{num_frozen:,} params) - Item Embedding")
-                print(f"    - 可训练参数: {len(trainable_params_names)}个 (~{num_trainable:,} params)")
-                print(f"    - 主要可训练模块: SASRec Transformer, Projectors, Experts, Router, CrossModalFusion")
-
-        print(f"  ✓ 所有 {len(clients)} 个客户端已应用Stage 3冻结策略")
+        # 注：原有的静态冻结策略已移除，改为在FedMemServer.train_round中动态应用
 
     # ============================================
     # 4. 创建FedMem服务器并开始训练
@@ -1051,7 +1063,9 @@ def main():
         enable_prototype_aggregation=args.enable_prototype_aggregation,
         num_memory_prototypes=args.num_memory_prototypes,
         # 【策略2】Partial Aggregation
-        partial_aggregation_warmup_rounds=args.partial_aggregation_warmup_rounds
+        partial_aggregation_warmup_rounds=args.partial_aggregation_warmup_rounds,
+        # [方案1] 渐进式解冻
+        stage=args.stage
     )
 
     # 开始训练（传递user_sequences用于负采样评估）

@@ -44,7 +44,8 @@
       "Bash(sort:*)",
       "Bash(if [ -f \"UR4Rec/checkpoints/stage3_moe/train_history.json\" ])",
       "Bash(then)",
-      "Bash(else)"
+      "Bash(else)",
+      "Bash(if [ -f \"UR4Rec/checkpoints/stage3_moe/fedmem_model.pt\" ])"
     ],
     "deny": [],
     "ask": []

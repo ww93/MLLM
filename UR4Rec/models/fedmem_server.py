@@ -48,7 +48,9 @@ class FedMemServer:
         enable_prototype_aggregation: bool = True,
         num_memory_prototypes: int = 5,
         # 【策略2】Partial Aggregation
-        partial_aggregation_warmup_rounds: int = 0  # 0表示禁用，>0表示启用
+        partial_aggregation_warmup_rounds: int = 0,  # 0表示禁用，>0表示启用
+        # [方案1] 渐进式解冻
+        stage: str = "full"  # "full", "pretrain_sasrec", "align_projectors", "finetune_moe"
     ):
         """
         Args:
@@ -75,6 +77,7 @@ class FedMemServer:
         self.enable_prototype_aggregation = enable_prototype_aggregation
         self.num_memory_prototypes = num_memory_prototypes
         self.partial_aggregation_warmup_rounds = partial_aggregation_warmup_rounds
+        self.stage = stage  # [方案1] 存储训练阶段，用于渐进式解冻
 
         # 聚合器
         self.aggregator = FederatedAggregator(
@@ -185,6 +188,112 @@ class FedMemServer:
         for client in selected_clients:
             client.set_global_abstract_memory(self.global_abstract_memory)
 
+    def apply_progressive_unfreezing(
+        self,
+        clients: List,
+        round_idx: int,
+        stage: str = "finetune_moe",
+        verbose: bool = False
+    ):
+        """
+        [方案1] 三阶段渐进式解冻策略
+
+        Stage 3a (Round 0-9): 只训练Router
+          - 冻结: item_emb + SASRec + 投影层 + Experts + Fusion
+          - 训练: Router (~8个参数)
+          - 目标: 学习"何时使用哪个Expert"，不破坏Stage 2的配合
+
+        Stage 3b (Round 10-29): 解冻Experts和Fusion
+          - 冻结: item_emb + SASRec + 投影层
+          - 训练: Router + Experts + Fusion
+          - 目标: 微调Expert输出，保持SASRec和投影层稳定
+
+        Stage 3c (Round 30-49): 全局微调
+          - 冻结: item_emb
+          - 训练: SASRec + 投影层 + Experts + Router + Fusion
+          - 学习率: 降低到1e-5
+          - 目标: 全局精细调优
+
+        Args:
+            clients: 客户端列表
+            round_idx: 当前轮数 (0-based)
+            stage: 训练阶段
+            verbose: 是否打印详细信息
+        """
+        if stage != "finetune_moe":
+            return  # 只在Stage 3应用渐进式解冻
+
+        # 确定当前子阶段
+        # 【关键修复】跳过Stage 3a，从Round 0开始联合训练Router+Expert
+        # 原因: Router无法学习路由随机Expert的输出，必须联合训练
+        if round_idx < 20:  # Stage 3ab: Round 0-19 (合并原3a+3b)
+            freeze_keywords = ['item_emb', 'item_embedding', 'sasrec', 'proj']
+            stage_name = "3ab: 联合训练Router+Experts+Fusion (避免Router学习路由垃圾)"
+            target_lr = None  # 保持原学习率
+        elif round_idx < 40:  # Stage 3c: Round 20-39
+            freeze_keywords = ['item_emb', 'item_embedding']
+            stage_name = "3c: 全局微调（降低LR）"
+            target_lr = 1e-5  # 降低学习率
+        else:  # Stage 3d: Round 40-49
+            freeze_keywords = ['item_emb', 'item_embedding']
+            stage_name = "3d: 最终微调（更小LR）"
+            target_lr = 5e-6  # 进一步降低
+
+        if verbose:
+            print(f"\n[渐进式解冻] 子阶段: {stage_name} (Round {round_idx})")
+
+        # 应用冻结策略到所有客户端
+        for client in clients:
+            client._ensure_model_initialized()
+
+            frozen_count = 0
+            trainable_count = 0
+
+            for name, param in client.model.named_parameters():
+                # 检查是否应该冻结
+                should_freeze = any(keyword in name.lower() for keyword in freeze_keywords)
+
+                param.requires_grad = not should_freeze
+
+                if should_freeze:
+                    frozen_count += 1
+                else:
+                    trainable_count += 1
+
+            # 重建优化器（只包含可训练参数）
+            trainable_params = [p for p in client.model.parameters() if p.requires_grad]
+
+            # 动态调整学习率
+            if target_lr is not None:
+                if round_idx == 20:  # 第一次进入Stage 3c
+                    client.learning_rate = target_lr
+                elif round_idx == 40:  # 第一次进入Stage 3d
+                    client.learning_rate = target_lr
+
+            client.optimizer = torch.optim.Adam(
+                trainable_params,
+                lr=client.learning_rate,
+                weight_decay=client.weight_decay
+            )
+
+        # 统计信息（只打印一次）
+        if verbose:
+            sample_client = clients[0]
+            sample_client._ensure_model_initialized()
+
+            num_frozen = sum(1 for p in sample_client.model.parameters() if not p.requires_grad)
+            num_trainable = sum(1 for p in sample_client.model.parameters() if p.requires_grad)
+            num_trainable_params = sum(p.numel() for p in sample_client.model.parameters() if p.requires_grad)
+
+            print(f"  冻结参数数: {num_frozen}")
+            print(f"  可训练参数数: {num_trainable} (~{num_trainable_params:,} params)")
+
+            if target_lr is not None:
+                if round_idx == 20:
+                    print(f"  学习率降低: 5e-4 → {target_lr:.0e} (Stage 3c开始)")
+                elif round_idx == 40:
+                    print(f"  学习率降低: 1e-5 → {target_lr:.0e} (Stage 3d开始)")
+
     def train_round(
         self,
         round_idx: int,
@@ -229,6 +338,14 @@ class FedMemServer:
         # 3. 【FedMem】下发全局抽象记忆
         if self.enable_prototype_aggregation:
             self.distribute_global_abstract_memory(selected_clients)
+
+        # 3.5. [方案1] 应用渐进式解冻策略（仅Stage 3）
+        self.apply_progressive_unfreezing(
+            clients=selected_clients,
+            round_idx=round_idx,
+            stage=self.stage,
+            verbose=verbose
+        )
 
         # 4. 客户端本地训练
         client_models = []
@@ -428,29 +545,38 @@ class FedMemServer:
             print(f"原型聚合: {'启用' if self.enable_prototype_aggregation else '禁用'}")
             print(f"{'='*60}\n")
 
+        # [调试] Round 0评估：评估checkpoint加载后、训练前的性能
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Round 0 (训练前评估 - 纯Checkpoint性能)")
+            print(f"{'='*60}")
+        round0_val_metrics = self.evaluate_global_model(user_sequences=user_sequences, split="val", verbose=verbose)
+        if verbose:
+            print(f"✓ Round 0 Checkpoint性能（未训练）: HR@10 = {round0_val_metrics['HR@10']:.4f}")
+            print(f"  这是Stage 2 checkpoint加载后的直接性能，应该接近Stage 2 final (~0.51)")
+            print()
+
         for round_idx in range(self.num_rounds):
             # 训练一轮
             round_metrics = self.train_round(round_idx, verbose=verbose)
 
-            # [加速优化2] 动态验证频率
-            # 前20轮：每5轮验证一次（Warmup阶段性能低，频繁验证浪费时间）
-            # 后期：每2轮验证一次（精细调优阶段）
-            should_validate = False
-            if round_idx < 20:
-                # Warmup阶段：每5轮或最后一轮验证
-                should_validate = (round_idx % 5 == 0) or (round_idx == self.num_rounds - 1)
-            else:
-                # 后期：每2轮或最后一轮验证
-                should_validate = (round_idx % 2 == 0) or (round_idx == self.num_rounds - 1)
+            # [修改] 每轮都评估（用于调试Stage 3性能问题）
+            val_metrics = self.evaluate_global_model(user_sequences=user_sequences, split="val", verbose=verbose)
 
-            # 在验证集上评估（传递user_sequences）
-            if should_validate:
-                val_metrics = self.evaluate_global_model(user_sequences=user_sequences, split="val", verbose=verbose)
-            else:
-                # 不验证时，复用上一次的验证结果
-                if len(self.train_history['val_metrics']) > 0:
-                    val_metrics = self.train_history['val_metrics'][-1]
-                    if verbose:
+            # 保留原评估逻辑的注释（如需恢复性能优化）
+            # should_validate = False
+            # if round_idx < 20:
+            #     should_validate = (round_idx % 5 == 0) or (round_idx == self.num_rounds - 1)
+            # else:
+            #     should_validate = (round_idx % 2 == 0) or (round_idx == self.num_rounds - 1)
+            #
+            # if should_validate:
+            #     val_metrics = self.evaluate_global_model(user_sequences=user_sequences, split="val", verbose=verbose)
+            # else:
+            #     if len(self.train_history['val_metrics']) > 0:
+            #         val_metrics = self.train_history['val_metrics'][-1]
+            if False:  # 禁用原逻辑
+                if verbose:
                         print(f"  ⏭️  跳过验证（将在Round {round_idx + (5 if round_idx < 20 else 2) - round_idx % (5 if round_idx < 20 else 2)}时验证）")
                 else:
                     # 第一轮必须验证
@@ -465,13 +591,10 @@ class FedMemServer:
                 'avg_memory_updates': round_metrics.get('avg_memory_updates', 0)
             })
 
-            # Early stopping 检查（只在实际验证时更新）
-            if should_validate:
-                current_val_metric = val_metrics['HR@10']  # 使用 HR@10 作为主要指标
-            else:
-                current_val_metric = None
+            # Early stopping 检查（每轮都验证，所以每轮都更新）
+            current_val_metric = val_metrics['HR@10']  # 使用 HR@10 作为主要指标
 
-            # 只在实际验证时才更新best model和early stopping计数
+            # 更新best model和early stopping计数
             if current_val_metric is not None:
                 if current_val_metric > self.best_val_metric:
                     self.best_val_metric = current_val_metric
